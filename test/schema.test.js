@@ -23,6 +23,9 @@ test('config schema is valid JSON and contains key sections', () => {
     assert.equal(typeof schema.properties.sticky_enabled, 'object');
     assert.equal(typeof schema.properties.sticky_new_connections_only, 'object');
     assert.equal(typeof schema.properties.auto_quarantine_nodes, 'object');
+    assert.equal(typeof schema.properties.attack_nodes, 'object');
+    assert.equal(typeof schema.properties.protection_enabled, 'object');
+    assert.equal(typeof schema.properties.probe_sampling, 'object');
     assert.equal(typeof schema.properties.api_token, 'object');
     assert.equal(typeof schema.properties.panel_auth_cookie, 'object');
     assert.equal(schema.properties.strategy.enum.includes('leastPing'), true);

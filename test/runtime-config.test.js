@@ -7,6 +7,10 @@ const { readEffectiveRuntime } = require('../lib/runtime-config');
 test('readEffectiveRuntime returns config-driven mutable settings', () => {
     const runtime = readEffectiveRuntime({
         probe_interval: '1m',
+        probe_sampling: 2,
+        probe_timeout: '4s',
+        probe_connectivity_url: 'https://connectivitycheck.gstatic.com/generate_204',
+        probe_http_method: 'GET',
         probe_url: 'https://www.gstatic.com/generate_204',
         fastest_probe_url: 'https://ya.ru',
         fastest_exclude_groups: ['🇷🇺 White List'],
@@ -31,6 +35,15 @@ test('readEffectiveRuntime returns config-driven mutable settings', () => {
         auto_drain_release_successes: 3,
         auto_drain_load_threshold: 0.95,
         auto_drain_score_penalty: 0.7,
+        protection_enabled: true,
+        protection_failures: 2,
+        protection_release_successes: 4,
+        protection_isolation_ttl_sec: 600,
+        protection_latency_threshold_ms: 1200,
+        protection_min_available_nodes: 2,
+        attack_nodes: [{ node: ' Germany-1 ', reason: 'ddos', source: 'admin', expires_at: '2030-01-01T00:00:00.000Z' }],
+        emergency_fallback_enabled: true,
+        emergency_fallback_max_nodes: 2,
         balancer_load_weight: 0.5,
         balancer_latency_weight: 0.5,
         balancer_max_latency_ms: 250,
@@ -39,6 +52,10 @@ test('readEffectiveRuntime returns config-driven mutable settings', () => {
     }, {});
 
     assert.equal(runtime.probeInterval, '1m');
+    assert.equal(runtime.probeSampling, 2);
+    assert.equal(runtime.probeTimeout, '4s');
+    assert.equal(runtime.probeConnectivityUrl, 'https://connectivitycheck.gstatic.com/generate_204');
+    assert.equal(runtime.probeHttpMethod, 'GET');
     assert.equal(runtime.fastestProbeUrl, 'https://ya.ru');
     assert.deepEqual(runtime.fastestExcludeGroups, ['🇷🇺 White List']);
     assert.deepEqual(runtime.fastestFallbackGroups, ['🇪🇺 LTE']);
@@ -62,6 +79,15 @@ test('readEffectiveRuntime returns config-driven mutable settings', () => {
     assert.equal(runtime.autoDrainReleaseSuccesses, 3);
     assert.equal(runtime.autoDrainLoadThreshold, 0.95);
     assert.equal(runtime.autoDrainScorePenalty, 0.7);
+    assert.equal(runtime.protectionEnabled, true);
+    assert.equal(runtime.protectionFailures, 2);
+    assert.equal(runtime.protectionReleaseSuccesses, 4);
+    assert.equal(runtime.protectionIsolationTtlSec, 600);
+    assert.equal(runtime.protectionLatencyThresholdMs, 1200);
+    assert.equal(runtime.protectionMinAvailableNodes, 2);
+    assert.deepEqual(runtime.attackNodes, [{ node: 'Germany-1', reason: 'ddos', source: 'admin', mode: 'manual', expires_at: '2030-01-01T00:00:00.000Z' }]);
+    assert.equal(runtime.emergencyFallbackEnabled, true);
+    assert.equal(runtime.emergencyFallbackMaxNodes, 2);
     assert.equal(runtime.balancerLoadWeight, 0.5);
     assert.equal(runtime.balancerLatencyWeight, 0.5);
     assert.equal(runtime.balancerMaxLatencyMs, 250);

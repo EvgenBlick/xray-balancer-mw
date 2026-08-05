@@ -10,6 +10,8 @@ Middleware для Remnawave, который превращает длинный 
 - Может полностью скрывать группы или отдельные ноды из итоговой подписки.
 - Может учитывать нагрузку нод из панели и убирать проблемные серверы.
 - Поддерживает sticky-маршрутизацию, чтобы клиент не прыгал между нодами.
+- Может автоматически изолировать недоступную ноду и выдать клиенту резервную.
+- Поддерживает ручной режим «нода под атакой» с TTL.
 - Не ломает заголовки subscription-page: `profile-title`, `announce`, `support-url` и другие заголовки Happ приходят клиенту как обычно.
 
 ## Что получает пользователь
@@ -68,7 +70,9 @@ cp config.json.example config.json
 {
   "port": 4100,
   "strategy": "leastPing",
-  "probe_interval": "1m",
+  "probe_interval": "30s",
+  "probe_sampling": 1,
+  "probe_timeout": "3s",
   "probe_url": "https://www.gstatic.com/generate_204",
   "fastest_probe_url": "https://ya.ru",
   "fastest_group": true,
@@ -177,6 +181,38 @@ https://sub.example.com {
   "sticky_ttl_sec": 300
 }
 ```
+
+### Включить защитный failover
+
+```json
+{
+  "node_stats": true,
+  "node_stats_interval_sec": 30,
+  "protection_enabled": true,
+  "protection_failures": 2,
+  "protection_release_successes": 3,
+  "protection_isolation_ttl_sec": 300,
+  "protection_latency_threshold_ms": 1500,
+  "protection_min_available_nodes": 1,
+  "emergency_fallback_enabled": true,
+  "emergency_fallback_max_nodes": 1,
+  "sticky_enabled": true,
+  "sticky_mode": "prefer"
+}
+```
+
+Высокая задержка сама по себе не доказывает DDoS. Автоматическая защита использует несколько последовательных проверок, сохраняет минимум одну доступную ноду и возвращает изолированную ноду только после TTL и успешного восстановления.
+
+Ручная изоляция на 30 минут:
+
+```bash
+curl -X POST http://xray-balancer-mw:4100/admin/attack-mode \
+  -H "x-admin-token: $ADMIN_TOKEN" \
+  -H "content-type: application/json" \
+  --data '{"node":"Germany-1","reason":"ddos","ttl_sec":1800}'
+```
+
+Обычные HTTP CDN защищают домен подписки, но не произвольный Reality/TCP/UDP-трафик. Для IP VPN-нод всё равно требуется anti-DDoS со стороны хостинг-провайдера.
 
 ## Проверка
 

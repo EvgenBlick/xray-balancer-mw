@@ -56,6 +56,62 @@ test('token cache can be cleared after runtime config changes', () => {
     assert.equal(cache.clear(), 0);
 });
 
+test('token cache reports size and byte usage across overwrite and clear', () => {
+    const cache = createTokenCache(30, 10);
+    const emptyHeadersBytes = Buffer.byteLength('{}');
+
+    cache.set('a', 'one', {});
+    cache.set('b', 'four', {});
+    assert.equal(cache.size(), 2);
+    assert.equal(cache.bytes(), 7 + (2 * emptyHeadersBytes));
+
+    cache.set('a', 'x', {});
+    assert.equal(cache.size(), 2);
+    assert.equal(cache.bytes(), 5 + (2 * emptyHeadersBytes));
+
+    assert.equal(cache.clear(), 2);
+    assert.equal(cache.size(), 0);
+    assert.equal(cache.bytes(), 0);
+});
+
+test('token cache evicts least recently used items to stay within maxBytes', () => {
+    const cache = createTokenCache(30, 10, { maxBytes: 12 });
+    cache.set('a', '1111', {});
+    cache.set('b', '2222', {});
+    assert.equal(cache.get('a').body, '1111');
+
+    cache.set('c', '3333', {});
+
+    assert.equal(cache.get('a').body, '1111');
+    assert.equal(cache.get('b'), null);
+    assert.equal(cache.get('c').body, '3333');
+    assert.equal(cache.size(), 2);
+    assert.equal(cache.bytes(), 12);
+});
+
+test('token cache rejects oversized items and removes an overwritten value', () => {
+    const cache = createTokenCache(30, { maxEntries: 10, maxBytes: 20, maxItemBytes: 6 });
+    cache.set('a', '1234', {});
+    assert.equal(cache.get('a').body, '1234');
+    assert.equal(cache.bytes(), 6);
+
+    cache.set('a', '12345', {});
+    assert.equal(cache.get('a'), null);
+    assert.equal(cache.size(), 0);
+    assert.equal(cache.bytes(), 0);
+});
+
+test('token cache decrements byte usage when stale entries expire', async () => {
+    const cache = createTokenCache(1, 10);
+    cache.set('a', '1234', {});
+    assert.equal(cache.bytes(), 6);
+
+    await new Promise(r => setTimeout(r, 10));
+    assert.equal(cache.getStale('a', 0), null);
+    assert.equal(cache.size(), 0);
+    assert.equal(cache.bytes(), 0);
+});
+
 test('rate limiter blocks burst overflow', () => {
     const limiter = createRateLimiter(100, 2);
     const ip = '1.1.1.1';
@@ -82,6 +138,22 @@ test('rate limiter cleanup cursor eventually reaches stale tail entries', () => 
     assert.equal(limiter.allow('hot', 2004), true);
 
     assert.equal(limiter.size(), 1);
+});
+
+test('rate limiter keeps a bounded number of IP entries', () => {
+    const limiter = createRateLimiter(1, 1, {
+        idleMs: 600000,
+        maxEntries: 2,
+    });
+
+    assert.equal(limiter.allow('1.1.1.1', 1000), true);
+    assert.equal(limiter.allow('1.1.1.1', 1001), false);
+    assert.equal(limiter.allow('2.2.2.2', 1002), true);
+    assert.equal(limiter.allow('3.3.3.3', 1003), true);
+    assert.equal(limiter.size(), 2);
+
+    assert.equal(limiter.allow('1.1.1.1', 1004), true);
+    assert.equal(limiter.size(), 2);
 });
 
 test('keyed limiter keeps bounded number of token buckets', () => {

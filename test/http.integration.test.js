@@ -577,12 +577,12 @@ test('socket retry shares the original upstream deadline', async (t) => {
     const upstream = http.createServer((req, res) => {
         upstreamHits += 1;
         if (upstreamHits === 1) {
-            setTimeout(() => req.socket.destroy(), 120);
+            setTimeout(() => req.socket.destroy(), 150);
             return;
         }
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        const timer = setTimeout(() => res.end(validXrayPayload()), 180);
+        const timer = setTimeout(() => res.end(validXrayPayload()), 700);
         res.on('close', () => clearTimeout(timer));
     });
     const upstreamPort = await listenOnRandomPort(upstream);
@@ -590,7 +590,7 @@ test('socket retry shares the original upstream deadline', async (t) => {
 
     const balancer = await startBalancer(t, {
         upstreamPort,
-        request_timeout_ms: 200,
+        request_timeout_ms: 800,
         cache_ttl_sec: 1,
     });
 
@@ -601,7 +601,7 @@ test('socket retry shares the original upstream deadline', async (t) => {
     assert.equal(response.status, 502);
     assert.match(body, /Timeout/);
     assert.equal(upstreamHits, 2);
-    assert.ok(Date.now() - started < 800);
+    assert.ok(Date.now() - started < 1500);
 });
 
 test('background refresh loop skips overlapping auto-groups runs', async (t) => {
@@ -986,4 +986,204 @@ test('parallel quarantine updates are serialized without losing nodes', async (t
 
     assert.equal(response.status, 200);
     assert.deepEqual([...body.quarantine_nodes].sort(), ['Node-A', 'Node-B']);
+});
+
+test('manual attack mode immediately excludes and restores a node', async (t) => {
+    let upstreamHits = 0;
+    const upstream = http.createServer((req, res) => {
+        upstreamHits += 1;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify([{
+            remarks: 'nodes',
+            outbounds: [
+                { tag: 'Germany-1', protocol: 'vless', settings: { vnext: [{ address: 'de1.example.com', port: 443 }] } },
+                { tag: 'Germany-2', protocol: 'vless', settings: { vnext: [{ address: 'de2.example.com', port: 443 }] } },
+            ],
+        }]));
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+
+    const balancer = await startBalancer(t, {
+        upstreamPort,
+        groups: { Germany: ['Germany'] },
+        strategy: 'leastPing',
+        sticky_enabled: true,
+        sticky_mode: 'prefer',
+        cache_ttl_sec: 60,
+    });
+
+    const first = await fetch(`${balancer.baseUrl}/attack-token`);
+    assert.equal(first.status, 200);
+    assert.match(await first.text(), /Germany-1/);
+
+    const isolate = await fetch(`${balancer.baseUrl}/admin/attack-mode`, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            'x-admin-token': 'integration-admin-token',
+        },
+        body: JSON.stringify({ node: 'Germany-1', reason: 'ddos', ttl_sec: 300 }),
+    });
+    assert.equal(isolate.status, 200);
+    const isolateBody = await isolate.json();
+    assert.equal(isolateBody.node.state, 'isolated');
+    assert.equal(isolateBody.node.isolation.reason, 'ddos');
+
+    const protectedResponse = await fetch(`${balancer.baseUrl}/attack-token`);
+    assert.equal(protectedResponse.status, 200);
+    const protectedBody = await protectedResponse.text();
+    assert.doesNotMatch(protectedBody, /Germany-1/);
+    assert.match(protectedBody, /Germany-2/);
+    assert.equal(upstreamHits, 2, 'attack transition must invalidate the subscription cache');
+
+    const status = await fetch(`${balancer.baseUrl}/admin/attack-mode`, {
+        headers: { 'x-admin-token': 'integration-admin-token' },
+    });
+    const statusBody = await status.json();
+    assert.equal(statusBody.summary.protected, 1);
+    assert.equal(statusBody.nodes[0].normalizedNode, 'germany-1');
+
+    const release = await fetch(`${balancer.baseUrl}/admin/attack-mode/${encodeURIComponent('Germany-1')}`, {
+        method: 'DELETE',
+        headers: { 'x-admin-token': 'integration-admin-token' },
+    });
+    assert.equal(release.status, 200);
+    assert.equal((await release.json()).released, true);
+
+    const restoredResponse = await fetch(`${balancer.baseUrl}/attack-token`);
+    assert.equal(restoredResponse.status, 200);
+    assert.match(await restoredResponse.text(), /Germany-1/);
+    assert.equal(upstreamHits, 3);
+});
+
+test('subscription fails closed when every outbound is isolated', async (t) => {
+    const upstream = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(validXrayPayload());
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+    const balancer = await startBalancer(t, { upstreamPort });
+
+    const isolate = await fetch(`${balancer.baseUrl}/admin/attack-mode`, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            'x-admin-token': 'integration-admin-token',
+        },
+        body: JSON.stringify({ node: 'Germany-1', ttl_sec: 300 }),
+    });
+    assert.equal(isolate.status, 200);
+
+    const response = await fetch(`${balancer.baseUrl}/all-isolated`);
+    assert.equal(response.status, 503);
+    assert.equal((await response.json()).code, 'NO_HEALTHY_NODES');
+});
+
+test('automatic protection isolates a repeatedly disconnected node but preserves reserve capacity', async (t) => {
+    const upstream = http.createServer((req, res) => {
+        if (req.url === '/api/nodes/') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ response: [
+                { name: 'Germany-1', isConnected: false, isDisabled: false, usersOnline: 0, totalRam: '2 GB', cpuCount: 1 },
+                { name: 'Germany-2', isConnected: true, isDisabled: false, usersOnline: 1, totalRam: '2 GB', cpuCount: 1 },
+            ] }));
+            return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify([{
+            remarks: 'nodes',
+            outbounds: [
+                { tag: 'Germany-1', protocol: 'vless', settings: { vnext: [{ address: 'de1.example.com', port: 443 }] } },
+                { tag: 'Germany-2', protocol: 'vless', settings: { vnext: [{ address: 'de2.example.com', port: 443 }] } },
+            ],
+        }]));
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+    const balancer = await startBalancer(t, {
+        upstreamPort,
+        remnawave_url: `http://127.0.0.1:${upstreamPort}`,
+        node_stats: true,
+        node_stats_interval_sec: 30,
+        protection_enabled: true,
+        protection_failures: 2,
+        protection_release_successes: 2,
+        protection_isolation_ttl_sec: 60,
+        protection_min_available_nodes: 1,
+    }, {
+        NODE_STATS: 'true',
+        API_TOKEN: 'panel-token',
+    });
+
+    for (let i = 0; i < 2; i += 1) {
+        const refresh = await fetch(`${balancer.baseUrl}/admin/refresh-stats`, {
+            method: 'POST',
+            headers: { 'x-admin-token': 'integration-admin-token' },
+        });
+        assert.equal(refresh.status, 200);
+    }
+
+    const attackStatus = await fetch(`${balancer.baseUrl}/admin/attack-mode`, {
+        headers: { 'x-admin-token': 'integration-admin-token' },
+    });
+    const attackBody = await attackStatus.json();
+    assert.equal(attackBody.summary.automatic, 1);
+    assert.equal(attackBody.nodes[0].normalizedNode, 'germany-1');
+
+    const response = await fetch(`${balancer.baseUrl}/auto-protection-token`);
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    assert.doesNotMatch(body, /Germany-1/);
+    assert.match(body, /Germany-2/);
+});
+
+test('normal groups receive a cross-group emergency fallback', async (t) => {
+    const upstream = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify([{
+            remarks: 'nodes',
+            outbounds: [
+                { tag: 'Germany-1', protocol: 'vless', settings: { vnext: [{ address: 'de.example.com', port: 443 }] } },
+                { tag: 'Finland-1', protocol: 'vless', settings: { vnext: [{ address: 'fi.example.com', port: 443 }] } },
+            ],
+        }]));
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+    const balancer = await startBalancer(t, {
+        upstreamPort,
+        strategy: 'leastPing',
+        groups: { Germany: ['Germany'], Finland: ['Finland'] },
+        emergency_fallback_enabled: true,
+        emergency_fallback_max_nodes: 1,
+    });
+
+    const response = await fetch(`${balancer.baseUrl}/fallback-token`);
+    assert.equal(response.status, 200);
+    const configs = await response.json();
+    const germany = configs.find((item) => item.remarks === 'Germany');
+    assert.ok(germany);
+    assert.equal(germany.routing.balancers[0].fallbackTag, 'Finland-1');
+    assert.ok(germany.outbounds.some((outbound) => outbound.tag === 'Finland-1'));
+});
+
+test('negative subscription responses are cached briefly', async (t) => {
+    let upstreamHits = 0;
+    const upstream = http.createServer((req, res) => {
+        upstreamHits += 1;
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('missing');
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+    const balancer = await startBalancer(t, { upstreamPort, negative_cache_ttl_sec: 30 });
+
+    const first = await fetch(`${balancer.baseUrl}/missing-token`);
+    const second = await fetch(`${balancer.baseUrl}/missing-token`);
+    assert.equal(first.status, 404);
+    assert.equal(second.status, 404);
+    assert.equal(await second.text(), 'missing');
+    assert.equal(upstreamHits, 1);
 });

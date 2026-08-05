@@ -21,6 +21,7 @@ const { buildGroupConfig } = require('./lib/group-builder');
 const { buildStickyTokenKey, createStickyStore } = require('./lib/sticky');
 const { createRequestGuard } = require('./lib/request-guard');
 const { readEffectiveRuntime } = require('./lib/runtime-config');
+const { createNodeProtectionManager } = require('./lib/node-protection');
 
 // ─── Загрузка конфига ───
 const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json');
@@ -37,6 +38,10 @@ const MUTABLE_CONFIG_KEYS = [
     'hidden_groups',
     'hidden_nodes',
     'probe_interval',
+    'probe_sampling',
+    'probe_timeout',
+    'probe_connectivity_url',
+    'probe_http_method',
     'fastest_probe_url',
     'quarantine_nodes',
     'auto_quarantine_nodes',
@@ -49,6 +54,15 @@ const MUTABLE_CONFIG_KEYS = [
     'auto_drain_release_successes',
     'auto_drain_load_threshold',
     'auto_drain_score_penalty',
+    'protection_enabled',
+    'protection_failures',
+    'protection_release_successes',
+    'protection_isolation_ttl_sec',
+    'protection_latency_threshold_ms',
+    'protection_min_available_nodes',
+    'attack_nodes',
+    'emergency_fallback_enabled',
+    'emergency_fallback_max_nodes',
     'sticky_enabled',
     'sticky_mode',
     'sticky_new_connections_only',
@@ -134,12 +148,18 @@ const MAX_USERS_PER_CPU = parseInt(process.env.MAX_USERS_PER_CPU, 10) || config.
 const CACHE_TTL_SEC = pickRuntimeInt('CACHE_TTL_SEC', 'cache_ttl_sec');
 const CACHE_STALE_IF_ERROR_SEC = pickRuntimeInt('CACHE_STALE_IF_ERROR_SEC', 'cache_stale_if_error_sec');
 const CACHE_MAX_ENTRIES = pickRuntimeInt('CACHE_MAX_ENTRIES', 'cache_max_entries');
+const CACHE_MAX_BYTES = pickPositiveInt('CACHE_MAX_BYTES', 'cache_max_bytes', 128 * 1024 * 1024);
+const CACHE_MAX_ITEM_BYTES = pickPositiveInt('CACHE_MAX_ITEM_BYTES', 'cache_max_item_bytes', 10 * 1024 * 1024);
 const RATE_LIMIT_PER_MINUTE = pickRuntimeInt('RATE_LIMIT_PER_MINUTE', 'rate_limit_per_minute');
 const RATE_LIMIT_BURST_10S = pickRuntimeInt('RATE_LIMIT_BURST_10S', 'rate_limit_burst_10s');
 const TOKEN_RATE_LIMIT_PER_MINUTE = pickRuntimeInt('TOKEN_RATE_LIMIT_PER_MINUTE', 'token_rate_limit_per_minute');
 const TOKEN_RATE_LIMIT_BURST_10S = pickRuntimeInt('TOKEN_RATE_LIMIT_BURST_10S', 'token_rate_limit_burst_10s');
 const TOKEN_LIMITER_MAX_ENTRIES = parseInt(process.env.TOKEN_LIMITER_MAX_ENTRIES, 10) || config.token_limiter_max_entries || 5000;
 const TOKEN_LIMITER_CLEANUP_BATCH = parseInt(process.env.TOKEN_LIMITER_CLEANUP_BATCH, 10) || config.token_limiter_cleanup_batch || 200;
+const IP_LIMITER_MAX_ENTRIES = pickPositiveInt('IP_LIMITER_MAX_ENTRIES', 'ip_limiter_max_entries', 10000);
+const ADMIN_LIMITER_MAX_ENTRIES = pickPositiveInt('ADMIN_LIMITER_MAX_ENTRIES', 'admin_limiter_max_entries', 2000);
+const MAX_UPSTREAM_CONCURRENCY = pickPositiveInt('MAX_UPSTREAM_CONCURRENCY', 'max_upstream_concurrency', 32);
+const NEGATIVE_CACHE_TTL_SEC = pickPositiveInt('NEGATIVE_CACHE_TTL_SEC', 'negative_cache_ttl_sec', 30);
 const TRUST_X_FORWARDED_FOR = pickRuntimeBool('TRUST_X_FORWARDED_FOR', 'trust_x_forwarded_for');
 const ADMIN_RATE_LIMIT_PER_MINUTE = parseInt(process.env.ADMIN_RATE_LIMIT_PER_MINUTE, 10) || config.admin_rate_limit_per_minute || 60;
 const ADMIN_RATE_LIMIT_BURST_10S = parseInt(process.env.ADMIN_RATE_LIMIT_BURST_10S, 10) || config.admin_rate_limit_burst_10s || 20;
@@ -159,6 +179,7 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN || config.admin_token || '';
 const WARMUP_TOKENS = Array.isArray(config.warmup_tokens) ? config.warmup_tokens : [];
 let QUARANTINE_NODES = [];
 let AUTO_QUARANTINE_NODES = [];
+let ATTACK_NODES = [];
 
 const MAX_RESPONSE_SIZE = 10 * 1024 * 1024;
 
@@ -186,15 +207,27 @@ let lastNodeStatsRefreshAt = 0;
 let lastNodeStatsError = null;
 let nodeStatsRefreshInFlight = null;
 const autoQuarantineState = new Map();
-const subscriptionCache = createTokenCache(CACHE_TTL_SEC, CACHE_MAX_ENTRIES);
+const subscriptionCache = createTokenCache(CACHE_TTL_SEC, CACHE_MAX_ENTRIES, {
+    maxBytes: CACHE_MAX_BYTES,
+    maxItemBytes: CACHE_MAX_ITEM_BYTES,
+});
+const negativeSubscriptionCache = createTokenCache(NEGATIVE_CACHE_TTL_SEC, Math.min(CACHE_MAX_ENTRIES, 5000), {
+    maxBytes: Math.min(CACHE_MAX_BYTES, 16 * 1024 * 1024),
+    maxItemBytes: 64 * 1024,
+});
 let subscriptionCacheGeneration = 0;
 const inFlightUpstreamFetches = new Map();
-const rateLimiter = createRateLimiter(RATE_LIMIT_PER_MINUTE, RATE_LIMIT_BURST_10S);
+let activeUpstreamFetches = 0;
+const rateLimiter = createRateLimiter(RATE_LIMIT_PER_MINUTE, RATE_LIMIT_BURST_10S, {
+    maxEntries: IP_LIMITER_MAX_ENTRIES,
+});
 const tokenRateLimiter = createKeyedRateLimiter(TOKEN_RATE_LIMIT_PER_MINUTE, TOKEN_RATE_LIMIT_BURST_10S, {
     maxEntries: TOKEN_LIMITER_MAX_ENTRIES,
     cleanupBatch: TOKEN_LIMITER_CLEANUP_BATCH,
 });
-const adminRateLimiter = createRateLimiter(ADMIN_RATE_LIMIT_PER_MINUTE, ADMIN_RATE_LIMIT_BURST_10S);
+const adminRateLimiter = createRateLimiter(ADMIN_RATE_LIMIT_PER_MINUTE, ADMIN_RATE_LIMIT_BURST_10S, {
+    maxEntries: ADMIN_LIMITER_MAX_ENTRIES,
+});
 const circuitBreaker = createCircuitBreaker(CIRCUIT_BREAKER_FAILURES, CIRCUIT_BREAKER_OPEN_SEC);
 const runtimeStats = {
     started_at: Date.now(),
@@ -205,6 +238,8 @@ const runtimeStats = {
     cache_fallback_stale_total: 0,
     cache_invalidations_total: 0,
     upstream_singleflight_joined_total: 0,
+    upstream_overload_rejected_total: 0,
+    negative_cache_hits_total: 0,
     background_overlap_skipped_total: 0,
     circuit_open_total: 0,
     rate_limited_ip_total: 0,
@@ -212,6 +247,12 @@ const runtimeStats = {
     upstream_non_json_total: 0,
     fake_config_passthrough_total: 0,
     quarantine_filtered_total: 0,
+    protection_isolations_total: 0,
+    protection_releases_total: 0,
+    protection_suppressed_total: 0,
+    sticky_released_by_protection_total: 0,
+    protection_filtered_total: 0,
+    all_nodes_unavailable_total: 0,
     sticky_assignments_total: 0,
     sticky_hits_total: 0,
     sticky_misses_total: 0,
@@ -228,6 +269,8 @@ const autoDrainNodes = new Set();
 const balancerRankState = new Map();
 let stickyStore = null;
 let stickyStoreConfig = null;
+let nodeProtectionManager = null;
+let nodeProtectionManagerConfig = null;
 let runtimeConfigMutationQueue = Promise.resolve();
 let shuttingDown = false;
 let shutdownStarted = false;
@@ -236,6 +279,63 @@ const activeBackgroundTasks = new Set();
 
 function getRuntimeConfig() {
     return readEffectiveRuntime(config, process.env);
+}
+
+function ensureNodeProtectionManager() {
+    const runtime = getRuntimeConfig();
+    const nextConfig = {
+        failureThreshold: runtime.protectionFailures,
+        recoverySuccessThreshold: runtime.protectionReleaseSuccesses,
+        isolationTtlSec: runtime.protectionIsolationTtlSec,
+    };
+    const unchanged = nodeProtectionManager
+        && nodeProtectionManagerConfig
+        && Object.keys(nextConfig).every((key) => nodeProtectionManagerConfig[key] === nextConfig[key]);
+    if (unchanged) return nodeProtectionManager;
+
+    const previousProtected = nodeProtectionManager
+        ? nodeProtectionManager.list({ protectedOnly: true })
+        : [];
+    const nextManager = createNodeProtectionManager(nextConfig);
+    const now = Date.now();
+    const seeds = new Map();
+
+    for (const node of previousProtected) {
+        seeds.set(node.normalizedNode, {
+            node: node.nodeName,
+            reason: node.isolation?.reason,
+            source: node.isolation?.source,
+            mode: node.isolation?.mode,
+            expiresAt: node.isolation?.expiresAt,
+        });
+    }
+    for (const node of runtime.attackNodes) {
+        seeds.set(normalizeNodeName(node.node), {
+            node: node.node,
+            reason: node.reason,
+            source: node.source,
+            mode: node.mode,
+            expiresAt: node.expires_at ? Date.parse(node.expires_at) : now + (runtime.protectionIsolationTtlSec * 1000),
+        });
+    }
+
+    for (const seed of seeds.values()) {
+        if (!seed.node || !Number.isFinite(seed.expiresAt) || seed.expiresAt <= now) continue;
+        const details = {
+            reason: seed.reason,
+            source: seed.source,
+            ttlSec: Math.max(1, Math.ceil((seed.expiresAt - now) / 1000)),
+        };
+        if (seed.mode === 'automatic') {
+            nextManager.isolateAutomatic(seed.node, details, now);
+        } else {
+            nextManager.isolateManual(seed.node, details, now);
+        }
+    }
+    nextManager.drainEvents();
+    nodeProtectionManager = nextManager;
+    nodeProtectionManagerConfig = nextConfig;
+    return nodeProtectionManager;
 }
 
 function ensureStickyStore() {
@@ -271,7 +371,9 @@ function applyMutableRuntimeConfig(nextConfig) {
     HIDDEN_NODES = runtime.hiddenNodes;
     QUARANTINE_NODES = runtime.quarantineNodes;
     AUTO_QUARANTINE_NODES = runtime.autoQuarantineNodes;
+    ATTACK_NODES = runtime.attackNodes;
     ensureStickyStore();
+    ensureNodeProtectionManager();
 }
 
 applyMutableRuntimeConfig(config);
@@ -445,6 +547,14 @@ async function fetchUpstreamSingleFlight(cacheKey, token, targetUrl, headers, re
         return existing;
     }
 
+    if (activeUpstreamFetches >= MAX_UPSTREAM_CONCURRENCY) {
+        runtimeStats.upstream_overload_rejected_total += 1;
+        const err = new Error('Upstream concurrency limit reached');
+        err.code = 'EUPSTREAMBUSY';
+        throw err;
+    }
+
+    activeUpstreamFetches += 1;
     const promise = fetchUrlWithSocketRetry(targetUrl, headers, requestId);
     inFlightUpstreamFetches.set(cacheKey, promise);
     try {
@@ -453,6 +563,7 @@ async function fetchUpstreamSingleFlight(cacheKey, token, targetUrl, headers, re
         if (inFlightUpstreamFetches.get(cacheKey) === promise) {
             inFlightUpstreamFetches.delete(cacheKey);
         }
+        activeUpstreamFetches = Math.max(0, activeUpstreamFetches - 1);
     }
 }
 
@@ -472,6 +583,7 @@ function isAdminAuthorized(req) {
 function sanitizeAdminPath(pathname) {
     if (/^\/admin\/debug\/token\/[a-zA-Z0-9_-]+$/.test(pathname)) return '/admin/debug/token/:token';
     if (/^\/admin\/quarantine\/.+$/.test(pathname)) return '/admin/quarantine/:node';
+    if (/^\/admin\/attack-mode\/.+$/.test(pathname)) return '/admin/attack-mode/:node';
     return pathname;
 }
 
@@ -672,11 +784,17 @@ async function upsertQuarantineNode(nodeName, requestId, opts = {}) {
                 auto_quarantine_nodes: nextAutoNodes,
             },
         };
-    }).then((result) => ({
-        changed: result.changed,
-        persisted: result.persisted && !result.data.error,
-        error: result.error || result.data.error || null,
-    }));
+    }).then((result) => {
+        if (result.changed) {
+            const released = ensureStickyStore().releaseByNode(nodeName);
+            runtimeStats.sticky_released_by_protection_total += released;
+        }
+        return {
+            changed: result.changed,
+            persisted: result.persisted && !result.data.error,
+            error: result.error || result.data.error || null,
+        };
+    });
 }
 
 async function removeQuarantineNode(nodeName, requestId) {
@@ -703,6 +821,150 @@ async function removeQuarantineNode(nodeName, requestId) {
         persisted: result.persisted,
         error: result.error,
     }));
+}
+
+function serializeProtectedNodes() {
+    return ensureNodeProtectionManager()
+        .list({ protectedOnly: true })
+        .map((node) => ({
+            node: node.nodeName,
+            reason: node.isolation?.reason || 'protection',
+            source: node.isolation?.source || 'system',
+            mode: node.isolation?.mode || 'automatic',
+            expires_at: node.isolation?.expiresAt ? new Date(node.isolation.expiresAt).toISOString() : null,
+        }));
+}
+
+function protectionStateChanged(events) {
+    return events.some((event) => (
+        event.type === 'isolation_updated'
+        || (event.to === 'isolated' && event.from !== 'recovering')
+        || (event.to === 'healthy' && (event.from === 'isolated' || event.from === 'recovering'))
+    ));
+}
+
+async function syncProtectionTransitions(events, requestId) {
+    if (!Array.isArray(events) || events.length === 0) return { changed: false, persisted: true };
+
+    for (const event of events) {
+        if (event.to === 'isolated' && event.from !== 'recovering') {
+            const released = ensureStickyStore().releaseByNode(event.nodeName);
+            runtimeStats.protection_isolations_total += 1;
+            runtimeStats.sticky_released_by_protection_total += released;
+            logger.warn('node_protection_isolated', {
+                request_id: requestId,
+                node: event.nodeName,
+                reason: event.reason,
+                source: event.source,
+                mode: event.mode,
+                expires_at: toIsoTimestamp(event.expiresAt),
+                sticky_released: released,
+            });
+        } else if (event.to === 'healthy' && (event.from === 'isolated' || event.from === 'recovering')) {
+            runtimeStats.protection_releases_total += 1;
+            logger.info('node_protection_released', {
+                request_id: requestId,
+                node: event.nodeName,
+                reason: event.reason,
+                source: event.source,
+            });
+        }
+    }
+
+    if (!protectionStateChanged(events)) return { changed: false, persisted: true };
+
+    clearSubscriptionCache('node_protection_transition', requestId);
+    const attackNodes = serializeProtectedNodes();
+    const result = await mutateRuntimeConfig(requestId, (currentConfig) => ({
+        changed: false,
+        nextConfig: {
+            ...currentConfig,
+            attack_nodes: attackNodes,
+        },
+    }));
+    if (!result.persisted) {
+        logger.error('node_protection_persist_failed', {
+            request_id: requestId,
+            error: result.error,
+        });
+    }
+    return { changed: true, persisted: result.persisted, error: result.error };
+}
+
+async function updateNodeProtectionFromNodes(nodes) {
+    const runtime = getRuntimeConfig();
+    const manager = ensureNodeProtectionManager();
+    manager.expire();
+
+    if (runtime.protectionEnabled && Array.isArray(nodes) && nodes.length > 0) {
+        const maxProtected = Math.max(0, nodes.length - runtime.protectionMinAvailableNodes);
+        let protectedCount = manager.summary().protected;
+
+        for (const node of nodes) {
+            const nodeName = (node.name || '').toString().trim();
+            if (!nodeName) continue;
+            const latencyMs = readNodeLatencyMs(node);
+            const reasons = [];
+            if (!Boolean(node.isConnected)) reasons.push('panel_disconnected');
+            if (Boolean(node.isDisabled)) reasons.push('panel_disabled');
+            if (latencyMs !== null && latencyMs >= runtime.protectionLatencyThresholdMs) {
+                reasons.push('latency_threshold');
+            }
+
+            if (reasons.length === 0) {
+                manager.recordSuccess(nodeName, { reason: 'health_check_recovered', source: 'panel_stats' });
+                continue;
+            }
+
+            const current = manager.get(nodeName);
+            const alreadyProtected = manager.isIsolated(nodeName);
+            const wouldIsolate = !alreadyProtected
+                && ((current?.failureCount || 0) + 1 >= runtime.protectionFailures);
+            if (wouldIsolate && protectedCount >= maxProtected) {
+                runtimeStats.protection_suppressed_total += 1;
+                logger.warn('node_protection_isolation_suppressed', {
+                    node: nodeName,
+                    reason: reasons.join(','),
+                    protected_count: protectedCount,
+                    max_protected: maxProtected,
+                });
+                continue;
+            }
+
+            const result = manager.recordFailure(nodeName, {
+                reason: reasons.join(','),
+                source: 'panel_stats',
+                ttlSec: runtime.protectionIsolationTtlSec,
+            });
+            if (!alreadyProtected && result.isolated) protectedCount += 1;
+        }
+    }
+
+    const events = manager.drainEvents();
+    if (events.length > 0) {
+        await syncProtectionTransitions(events, `node-protection-${Date.now()}`);
+    }
+}
+
+async function expireProtectionNodes() {
+    const manager = ensureNodeProtectionManager();
+    manager.expire();
+    const events = manager.drainEvents();
+    if (events.length > 0) {
+        await syncProtectionTransitions(events, `node-protection-expiry-${Date.now()}`);
+    } else {
+        const attackNodes = serializeProtectedNodes();
+        if (attackNodes.length !== ATTACK_NODES.length) {
+            await mutateRuntimeConfig(`node-protection-cleanup-${Date.now()}`, (currentConfig) => ({
+                changed: false,
+                nextConfig: {
+                    ...currentConfig,
+                    attack_nodes: attackNodes,
+                },
+            }));
+        }
+    }
+    return { ok: true, events: events.length };
 }
 
 async function updateAutoQuarantineFromNodes(nodes) {
@@ -852,6 +1114,7 @@ function updateAutoDrainFromNodes(nodes) {
     if (!runtime.autoDrainEnabled || !Array.isArray(nodes) || nodes.length === 0) return;
 
     const activeNames = new Set();
+    let changed = false;
     for (const node of nodes) {
         const nodeName = (node.name || '').toString().trim();
         if (!nodeName) continue;
@@ -878,6 +1141,9 @@ function updateAutoDrainFromNodes(nodes) {
         if (!prev.drained && prev.fail >= runtime.autoDrainFailures) {
             prev.drained = true;
             if (normalizedName) autoDrainNodes.add(normalizedName);
+            const released = ensureStickyStore().releaseByNode(nodeName);
+            runtimeStats.sticky_released_by_protection_total += released;
+            changed = true;
             logger.warn('auto_drain_added', {
                 node: nodeName,
                 load,
@@ -887,6 +1153,7 @@ function updateAutoDrainFromNodes(nodes) {
         } else if (prev.drained && prev.ok >= runtime.autoDrainReleaseSuccesses) {
             prev.drained = false;
             if (normalizedName) autoDrainNodes.delete(normalizedName);
+            changed = true;
             logger.info('auto_drain_released', {
                 node: nodeName,
                 load,
@@ -900,8 +1167,12 @@ function updateAutoDrainFromNodes(nodes) {
     for (const nodeName of autoDrainState.keys()) {
         if (!activeNames.has(nodeName)) {
             autoDrainState.delete(nodeName);
-            autoDrainNodes.delete(normalizeNodeName(nodeName));
+            if (autoDrainNodes.delete(normalizeNodeName(nodeName))) changed = true;
         }
+    }
+
+    if (changed) {
+        clearSubscriptionCache('auto_drain_transition', `auto-drain-${Date.now()}`);
     }
 }
 
@@ -923,6 +1194,7 @@ async function fetchNodeStatsNow() {
         const nodes = data.response || (Array.isArray(data) ? data : []);
         updateAutoDrainFromNodes(nodes);
         await updateAutoQuarantineFromNodes(nodes);
+        await updateNodeProtectionFromNodes(nodes);
 
         const newCache = {};
         for (const node of nodes) {
@@ -1205,22 +1477,15 @@ const SKIP_RESPONSE_HEADERS = new Set([
 ]);
 
 // Request/response header helpers.
-const CACHE_VARIANT_HEADER_SKIP = new Set([
-    'host',
-    'accept-language',
-    'x-forwarded-for',
-    'x-forwarded-proto',
-    'x-real-ip',
-    'x-request-id',
-    'x-correlation-id',
-    'traceparent',
-    'tracestate',
-    'sec-fetch-dest',
-    'sec-fetch-mode',
-    'sec-fetch-site',
-    'sec-fetch-user',
-    'priority',
-    'dnt',
+const CACHE_VARIANT_HEADERS = new Set([
+    'accept',
+    'user-agent',
+    'x-hwid',
+    'x-device-id',
+    'x-device-model',
+    'x-device-os',
+    'x-platform',
+    'x-app-version',
 ]);
 
 const NO_STORE_HEADERS = {
@@ -1274,7 +1539,7 @@ function buildSubscriptionCacheKey(token, forwardHeaders = {}) {
     const variantHeaders = [];
     for (const [key, value] of Object.entries(forwardHeaders)) {
         const normalizedKey = key.toLowerCase();
-        if (CACHE_VARIANT_HEADER_SKIP.has(normalizedKey)) continue;
+        if (!CACHE_VARIANT_HEADERS.has(normalizedKey)) continue;
         const normalizedValue = normalizeHeaderValue(value);
         if (normalizedValue) variantHeaders.push([normalizedKey, normalizedValue]);
     }
@@ -1316,6 +1581,24 @@ function getCachedFallback(token) {
     return null;
 }
 
+function getNegativeCachedResponse(cacheKey) {
+    const item = negativeSubscriptionCache.get(cacheKey);
+    if (!item) return null;
+    try {
+        return JSON.parse(item.body);
+    } catch {
+        return null;
+    }
+}
+
+function setNegativeCachedResponse(cacheKey, upstream) {
+    negativeSubscriptionCache.set(cacheKey, JSON.stringify({
+        status: upstream.status,
+        body: upstream.body,
+        headers: sanitizeHeadersForCache(upstream.headers),
+    }));
+}
+
 function isServiceFailureStatus(status) {
     return status >= 500;
 }
@@ -1334,6 +1617,15 @@ function normalizeNodeName(value) {
 
 function buildQuarantineSet() {
     return new Set(QUARANTINE_NODES.map(normalizeNodeName).filter(Boolean));
+}
+
+function buildProtectionSet() {
+    return new Set(
+        ensureNodeProtectionManager()
+            .list({ protectedOnly: true })
+            .map((node) => node.normalizedNode)
+            .filter(Boolean)
+    );
 }
 
 function buildGroupNameSet(names) {
@@ -1442,6 +1734,8 @@ function setNonOverlappingInterval(taskName, task, intervalMs) {
 }
 
 function scheduleStartupTasks() {
+    setNonOverlappingInterval('expire_protection_nodes', () => expireProtectionNodes(), 30000);
+
     if (AUTO_GROUPS && API_TOKEN) {
         runManagedBackgroundTask('initial_refresh_groups', () => refreshGroups()).finally(() => {
             if (!shuttingDown) {
@@ -1526,6 +1820,7 @@ const server = http.createServer(async (req, res) => {
                 hidden_nodes: HIDDEN_NODES,
                 quarantine_nodes: QUARANTINE_NODES,
                 auto_quarantine_nodes: AUTO_QUARANTINE_NODES,
+                attack_nodes: ATTACK_NODES,
                 auto_quarantine_enabled: runtime.autoQuarantineEnabled,
                 auto_quarantine_failures: runtime.autoQuarantineFailures,
                 auto_quarantine_release_successes: runtime.autoQuarantineReleaseSuccesses,
@@ -1541,7 +1836,19 @@ const server = http.createServer(async (req, res) => {
                 sticky_ttl_sec: runtime.stickyTtlSec,
                 sticky_max_entries: runtime.stickyMaxEntries,
                 probe_interval: runtime.probeInterval,
+                probe_sampling: runtime.probeSampling,
+                probe_timeout: runtime.probeTimeout,
+                probe_connectivity_url: runtime.probeConnectivityUrl,
+                probe_http_method: runtime.probeHttpMethod,
                 fastest_probe_url: runtime.fastestProbeUrl,
+                protection_enabled: runtime.protectionEnabled,
+                protection_failures: runtime.protectionFailures,
+                protection_release_successes: runtime.protectionReleaseSuccesses,
+                protection_isolation_ttl_sec: runtime.protectionIsolationTtlSec,
+                protection_latency_threshold_ms: runtime.protectionLatencyThresholdMs,
+                protection_min_available_nodes: runtime.protectionMinAvailableNodes,
+                emergency_fallback_enabled: runtime.emergencyFallbackEnabled,
+                emergency_fallback_max_nodes: runtime.emergencyFallbackMaxNodes,
                 balancer_load_weight: runtime.balancerLoadWeight,
                 balancer_latency_weight: runtime.balancerLatencyWeight,
                 balancer_max_latency_ms: runtime.balancerMaxLatencyMs,
@@ -1580,6 +1887,7 @@ const server = http.createServer(async (req, res) => {
                 if (incomingFastest !== undefined) nextConfig.fastest_group = incomingFastest;
                 if (incomingFastestName !== undefined) nextConfig.fastest_group_name = incomingFastestName;
                 for (const key of MUTABLE_CONFIG_KEYS) {
+                    if (key === 'attack_nodes') continue;
                     if (payload[key] !== undefined) {
                         nextConfig[key] = payload[key];
                     }
@@ -1626,6 +1934,7 @@ const server = http.createServer(async (req, res) => {
                 hidden_nodes: HIDDEN_NODES,
                 quarantine_nodes: QUARANTINE_NODES,
                 auto_quarantine_nodes: AUTO_QUARANTINE_NODES,
+                attack_nodes: ATTACK_NODES,
                 auto_quarantine_enabled: runtime.autoQuarantineEnabled,
                 auto_quarantine_failures: runtime.autoQuarantineFailures,
                 auto_quarantine_release_successes: runtime.autoQuarantineReleaseSuccesses,
@@ -1641,7 +1950,19 @@ const server = http.createServer(async (req, res) => {
                 sticky_ttl_sec: runtime.stickyTtlSec,
                 sticky_max_entries: runtime.stickyMaxEntries,
                 probe_interval: runtime.probeInterval,
+                probe_sampling: runtime.probeSampling,
+                probe_timeout: runtime.probeTimeout,
+                probe_connectivity_url: runtime.probeConnectivityUrl,
+                probe_http_method: runtime.probeHttpMethod,
                 fastest_probe_url: runtime.fastestProbeUrl,
+                protection_enabled: runtime.protectionEnabled,
+                protection_failures: runtime.protectionFailures,
+                protection_release_successes: runtime.protectionReleaseSuccesses,
+                protection_isolation_ttl_sec: runtime.protectionIsolationTtlSec,
+                protection_latency_threshold_ms: runtime.protectionLatencyThresholdMs,
+                protection_min_available_nodes: runtime.protectionMinAvailableNodes,
+                emergency_fallback_enabled: runtime.emergencyFallbackEnabled,
+                emergency_fallback_max_nodes: runtime.emergencyFallbackMaxNodes,
                 balancer_load_weight: runtime.balancerLoadWeight,
                 balancer_latency_weight: runtime.balancerLatencyWeight,
                 balancer_max_latency_ms: runtime.balancerMaxLatencyMs,
@@ -1685,17 +2006,131 @@ const server = http.createServer(async (req, res) => {
             return;
         }
         const quarantineSet = buildQuarantineSet();
+        const protectionManager = ensureNodeProtectionManager();
         const enriched = Object.fromEntries(
             Object.entries(nodeStatsCache).map(([name, stats]) => [
                 name,
                 {
                     ...stats,
                     quarantined: isNodeQuarantined(name, quarantineSet, stats?.sourceNode),
+                    protection: protectionManager.get(stats?.sourceNode || name),
                 },
             ]),
         );
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(enriched, null, 2));
+        return;
+    }
+
+    if (pathname === '/admin/attack-mode') {
+        if (!enforceAdminAccess(req, res, requestId, clientIp, pathname)) {
+            return;
+        }
+
+        if (req.method === 'GET') {
+            await expireProtectionNodes();
+            const manager = ensureNodeProtectionManager();
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                status: 'ok',
+                request_id: requestId,
+                protection_enabled: getRuntimeConfig().protectionEnabled,
+                summary: manager.summary(),
+                nodes: manager.list({ protectedOnly: true }),
+            }));
+            return;
+        }
+
+        if (req.method !== 'POST') {
+            sendMethodNotAllowed(res, requestId, ['GET', 'POST']);
+            return;
+        }
+
+        try {
+            const payload = await readJsonBody(req);
+            const nodeName = typeof payload.node === 'string' ? payload.node.trim() : '';
+            const reason = typeof payload.reason === 'string' ? payload.reason.trim() : 'manual_ddos';
+            const ttlSec = Number.isInteger(payload.ttl_sec)
+                ? payload.ttl_sec
+                : getRuntimeConfig().protectionIsolationTtlSec;
+            if (!nodeName || nodeName.length > 128) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ status: 'error', code: 'INVALID_NODE', request_id: requestId }));
+                return;
+            }
+            if (!reason || reason.length > 256 || ttlSec < 1 || ttlSec > 604800) {
+                res.writeHead(422, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ status: 'error', code: 'INVALID_ATTACK_MODE_OPTIONS', request_id: requestId }));
+                return;
+            }
+            if (payload.disconnect === true) {
+                res.writeHead(422, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ status: 'error', code: 'REMOTE_DISCONNECT_NOT_CONFIGURED', request_id: requestId }));
+                return;
+            }
+
+            const manager = ensureNodeProtectionManager();
+            const result = manager.isolateManual(nodeName, {
+                reason,
+                source: 'admin',
+                ttlSec,
+            });
+            const persisted = await syncProtectionTransitions(manager.drainEvents(), requestId);
+            res.writeHead(persisted.persisted ? 200 : 500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                status: persisted.persisted ? 'ok' : 'error',
+                code: persisted.persisted ? undefined : 'CONFIG_PERSIST_FAILED',
+                request_id: requestId,
+                node: result.node,
+                persisted: persisted.persisted,
+                persist_error: persisted.error || null,
+            }));
+            return;
+        } catch (err) {
+            const code = err.message === 'Invalid JSON body' ? 400 : 422;
+            res.writeHead(code, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', request_id: requestId, message: err.message }));
+            return;
+        }
+    }
+
+    const adminAttackDeleteMatch = pathname.match(/^\/admin\/attack-mode\/(.+)$/);
+    if (adminAttackDeleteMatch) {
+        if (!enforceAdminAccess(req, res, requestId, clientIp, pathname)) {
+            return;
+        }
+        if (req.method !== 'DELETE') {
+            sendMethodNotAllowed(res, requestId, ['DELETE']);
+            return;
+        }
+
+        let nodeName = '';
+        try {
+            nodeName = decodeURIComponent(adminAttackDeleteMatch[1] || '').trim();
+        } catch {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'INVALID_PATH_ENCODING', request_id: requestId }));
+            return;
+        }
+        if (!nodeName || nodeName.length > 128) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'INVALID_NODE', request_id: requestId }));
+            return;
+        }
+
+        const manager = ensureNodeProtectionManager();
+        const result = manager.release(nodeName, { reason: 'manual_release', source: 'admin' });
+        const persisted = await syncProtectionTransitions(manager.drainEvents(), requestId);
+        res.writeHead(persisted.persisted ? 200 : 500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            status: persisted.persisted ? 'ok' : 'error',
+            code: persisted.persisted ? undefined : 'CONFIG_PERSIST_FAILED',
+            request_id: requestId,
+            released: result.released,
+            node: result.node,
+            persisted: persisted.persisted,
+            persist_error: persisted.error || null,
+        }));
         return;
     }
 
@@ -1868,6 +2303,7 @@ const server = http.createServer(async (req, res) => {
         }
         const runtime = getRuntimeConfig();
         const currentStickyStore = ensureStickyStore();
+        const currentProtectionManager = ensureNodeProtectionManager();
         const cb = circuitBreaker.status();
         const nodeStatsAgeMs = getNodeStatsAgeMs();
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1887,12 +2323,28 @@ const server = http.createServer(async (req, res) => {
             node_stats_age_sec: nodeStatsAgeMs === null ? null : Math.round(nodeStatsAgeMs / 1000),
             node_stats_stale_sec: NODE_STATS_STALE_SEC,
             cached_nodes: Object.keys(nodeStatsCache).length,
+            subscription_cache: {
+                entries: subscriptionCache.size(),
+                bytes: subscriptionCache.bytes(),
+                max_bytes: CACHE_MAX_BYTES,
+            },
+            negative_cache: {
+                entries: negativeSubscriptionCache.size(),
+                bytes: negativeSubscriptionCache.bytes(),
+            },
+            active_upstream_fetches: activeUpstreamFetches,
+            max_upstream_concurrency: MAX_UPSTREAM_CONCURRENCY,
+            ip_limiter_size: rateLimiter.size(),
+            admin_limiter_size: adminRateLimiter.size(),
             token_limiter_size: tokenRateLimiter.size(),
             quarantine_nodes: QUARANTINE_NODES,
             auto_quarantine_nodes: AUTO_QUARANTINE_NODES,
             quarantine_count: QUARANTINE_NODES.length,
             sticky_enabled: runtime.stickyEnabled,
             sticky: currentStickyStore.summary(),
+            protection_enabled: runtime.protectionEnabled,
+            protection: currentProtectionManager.summary(),
+            protected_nodes: currentProtectionManager.list({ protectedOnly: true }),
         }));
         return;
     }
@@ -2028,6 +2480,19 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
+
+    const negativeCached = getNegativeCachedResponse(cacheKey);
+    if (negativeCached) {
+        runtimeStats.negative_cache_hits_total += 1;
+        logger.info('negative_cache_hit', { request_id: requestId, token: redactTokenPath(`/${token}`).slice(1) });
+        res.writeHead(
+            negativeCached.status,
+            forwardResponseHeaders(negativeCached.headers || {}, 'text/plain; charset=utf-8')
+        );
+        res.end(negativeCached.body || 'Not Found');
+        return;
+    }
+
     try {
         // Пробрасываем ВСЕ заголовки от клиента, кроме тех что ломают проксирование
         // Дефолтный User-Agent если клиент не прислал
@@ -2048,6 +2513,9 @@ const server = http.createServer(async (req, res) => {
         });
 
         if (upstream.status !== 200) {
+            if (upstream.status === 404 || upstream.status === 410) {
+                setNegativeCachedResponse(cacheKey, upstream);
+            }
             if (isServiceFailureStatus(upstream.status)) {
                 lastUpstreamError = `upstream_status_${upstream.status}`;
                 circuitBreaker.recordFailure();
@@ -2171,6 +2639,25 @@ const server = http.createServer(async (req, res) => {
             }
         }
 
+        const protectionSet = buildProtectionSet();
+        if (protectionSet.size > 0) {
+            const before = allOutbounds.length;
+            allOutbounds = allOutbounds.filter((ob) => {
+                const stats = nodeStatsFresh ? getNodeStats(nodeStatsCache, ob) : null;
+                return !isNodeQuarantined(ob.tag, protectionSet, stats?.sourceNode);
+            });
+            const removed = before - allOutbounds.length;
+            if (removed > 0) {
+                runtimeStats.protection_filtered_total += removed;
+                logger.warn('outbounds_filtered_by_protection', {
+                    request_id: requestId,
+                    before,
+                    after: allOutbounds.length,
+                    protected_count: protectionSet.size,
+                });
+            }
+        }
+
         const beforeHiddenFilter = allOutbounds.length;
         allOutbounds = filterHiddenOutbounds(allOutbounds, GROUPS, HIDDEN_GROUPS, HIDDEN_NODES);
         const hiddenRemoved = beforeHiddenFilter - allOutbounds.length;
@@ -2185,9 +2672,21 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (allOutbounds.length === 0) {
-            logger.warn('all_outbounds_quarantined', { request_id: requestId, quarantine_count: QUARANTINE_NODES.length });
-            res.writeHead(200, forwardResponseHeaders(upstream.headers, 'application/json; charset=utf-8'));
-            res.end(upstream.body);
+            runtimeStats.all_nodes_unavailable_total += 1;
+            logger.error('all_outbounds_unavailable', {
+                request_id: requestId,
+                quarantine_count: QUARANTINE_NODES.length,
+                protection_count: protectionSet.size,
+            });
+            res.writeHead(503, {
+                'Content-Type': 'application/json; charset=utf-8',
+                'Retry-After': '30',
+            });
+            res.end(JSON.stringify({
+                status: 'error',
+                code: 'NO_HEALTHY_NODES',
+                request_id: requestId,
+            }));
             return;
         }
 
@@ -2273,6 +2772,10 @@ const server = http.createServer(async (req, res) => {
                 fallbackOutbounds: fastestOutbounds.length > 0 ? fastestFallbackOutbounds : [],
                 probeUrl: runtime.fastestProbeUrl,
                 probeInterval: runtime.probeInterval,
+                probeSampling: runtime.probeSampling,
+                probeTimeout: runtime.probeTimeout,
+                probeConnectivity: runtime.probeConnectivityUrl,
+                probeHttpMethod: runtime.probeHttpMethod,
                 strategy: STRATEGY,
             });
             resultConfigs.push(fastestConfig);
@@ -2329,9 +2832,20 @@ const server = http.createServer(async (req, res) => {
                 }
             }
 
+            const selectedTagSet = new Set(selectedGroupOutbounds.map((outbound) => outbound.tag));
+            const emergencyFallbackOutbounds = runtime.emergencyFallbackEnabled && entry.kind !== 'node'
+                ? allOutbounds
+                    .filter((outbound) => !selectedTagSet.has(outbound.tag))
+                    .slice(0, runtime.emergencyFallbackMaxNodes)
+                : [];
             const groupConfig = buildGroupConfig(baseConfig, configName, selectedGroupOutbounds, {
+                fallbackOutbounds: emergencyFallbackOutbounds,
                 probeUrl: PROBE_URL,
                 probeInterval: runtime.probeInterval,
+                probeSampling: runtime.probeSampling,
+                probeTimeout: runtime.probeTimeout,
+                probeConnectivity: runtime.probeConnectivityUrl,
+                probeHttpMethod: runtime.probeHttpMethod,
                 strategy: STRATEGY,
             });
             resultConfigs.push(groupConfig);
@@ -2389,7 +2903,9 @@ const server = http.createServer(async (req, res) => {
     } catch (err) {
         runtimeStats.request_failures += 1;
         lastUpstreamError = err.message;
-        circuitBreaker.recordFailure();
+        if (err.code !== 'EUPSTREAMBUSY') {
+            circuitBreaker.recordFailure();
+        }
         logger.error('request_failed', { request_id: requestId, message: err.message });
         const fallback = getCachedFallback(cacheKey);
         if (fallback) {
@@ -2401,6 +2917,14 @@ const server = http.createServer(async (req, res) => {
             return;
         }
         if (!res.headersSent) {
+            if (err.code === 'EUPSTREAMBUSY') {
+                res.writeHead(503, {
+                    'Content-Type': 'application/json; charset=utf-8',
+                    'Retry-After': '5',
+                });
+                res.end(JSON.stringify({ status: 'error', code: 'UPSTREAM_BUSY', request_id: requestId }));
+                return;
+            }
             if (isSocketHangupError(err)) {
                 res.writeHead(404, {
                     'Content-Type': 'text/plain; charset=utf-8',
@@ -2417,6 +2941,18 @@ const server = http.createServer(async (req, res) => {
 
 // ─── Graceful shutdown ───
 
+server.headersTimeout = 10000;
+server.requestTimeout = Math.max(15000, REQUEST_TIMEOUT_MS + 5000);
+server.keepAliveTimeout = 5000;
+server.maxHeadersCount = 100;
+server.maxRequestsPerSocket = 100;
+server.on('clientError', (err, socket) => {
+    logger.warn('http_client_error', { code: err.code || null, message: err.message });
+    if (socket.writable) {
+        socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+    }
+});
+
 function shutdown(signal) {
     if (shutdownStarted) return;
     shutdownStarted = true;
@@ -2424,11 +2960,12 @@ function shutdown(signal) {
     clearBackgroundIntervals();
 
     console.log(`\n[shutdown] ${signal} — завершаем...`);
-    const forceExitTimer = setTimeout(() => { process.exit(1); }, 5000);
+    const shutdownTimeoutMs = Math.max(15000, REQUEST_TIMEOUT_MS + 5000);
+    const forceExitTimer = setTimeout(() => { process.exit(1); }, shutdownTimeoutMs);
     if (typeof forceExitTimer.unref === 'function') forceExitTimer.unref();
 
     server.close(async () => {
-        const backgroundWait = await waitForBackgroundTasks(4000);
+        const backgroundWait = await waitForBackgroundTasks(Math.max(5000, REQUEST_TIMEOUT_MS));
         if (backgroundWait.timedOut) {
             logger.warn('background_tasks_shutdown_timeout', { pending: backgroundWait.pending });
         }
@@ -2484,9 +3021,15 @@ async function start() {
             `💧 Auto drain: ${runtime.autoDrainEnabled ? `✅ (fails=${runtime.autoDrainFailures}, release=${runtime.autoDrainReleaseSuccesses}, threshold=${runtime.autoDrainLoadThreshold}, penalty=${runtime.autoDrainScorePenalty})` : '❌'}`
         );
         console.log(
+            `🛡️ Node protection: ${runtime.protectionEnabled ? `✅ (fails=${runtime.protectionFailures}, release=${runtime.protectionReleaseSuccesses}, ttl=${runtime.protectionIsolationTtlSec}s, latency>=${runtime.protectionLatencyThresholdMs}ms, reserve=${runtime.protectionMinAvailableNodes})` : '❌'}; isolated=${ATTACK_NODES.length}`
+        );
+        console.log(
+            `🛟 Emergency fallback: ${runtime.emergencyFallbackEnabled ? `✅ (max=${runtime.emergencyFallbackMaxNodes})` : '❌'}`
+        );
+        console.log(
             `📈 Score model: load_weight=${runtime.balancerLoadWeight} latency_weight=${runtime.balancerLatencyWeight} max_latency=${runtime.balancerMaxLatencyMs}ms alpha=${runtime.balancerSmoothingAlpha} hysteresis=${runtime.balancerHysteresisDelta}`
         );
-        console.log(`⏱️ Upstream: timeout=${REQUEST_TIMEOUT_MS}ms redirects=${MAX_REDIRECTS}`);
+        console.log(`⏱️ Upstream: timeout=${REQUEST_TIMEOUT_MS}ms redirects=${MAX_REDIRECTS} concurrency=${MAX_UPSTREAM_CONCURRENCY}`);
         console.log(`🧱 Circuit breaker: fails=${CIRCUIT_BREAKER_FAILURES} open=${CIRCUIT_BREAKER_OPEN_SEC}s`);
         console.log(`🚫 Quarantine: ${QUARANTINE_NODES.length} nodes`);
         console.log(`💾 Runtime config: ${CONFIG_RUNTIME_PATH || CONFIG_PATH}`);

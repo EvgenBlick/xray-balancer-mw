@@ -43,9 +43,11 @@
     ],
     "pingConfig": {
       "destination": "https://example.com/ping",
+      "connectivity": "",
       "interval": "3m",
       "sampling": 1,
-      "timeout": "3s"
+      "timeout": "3s",
+      "httpMethod": "HEAD"
     }
   },
   "routing": {
@@ -66,7 +68,8 @@
             ],
             "tolerance": 0.8
           }
-        }
+        },
+        "fallbackTag": "Germany-1"
       }
     ],
     "rules": [

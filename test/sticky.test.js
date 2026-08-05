@@ -79,3 +79,15 @@ test('sticky scope keys keep per-group assignments isolated for the same token',
     assert.equal(nextGermany.selected.tag, 'Germany-1');
     assert.notEqual(fastestKey, germanyKey);
 });
+
+test('sticky store releases every assignment for an isolated node', () => {
+    const store = createStickyStore({ ttlSec: 60, maxEntries: 10 });
+    store.assign('fastest::one', 'Germany-1', 1000);
+    store.assign('group::one', 'germany-1', 1000);
+    store.assign('fastest::two', 'Finland-1', 1000);
+
+    assert.equal(store.releaseByNode(' Germany-1 ', 1100), 2);
+    assert.equal(store.get('fastest::one', 1100), null);
+    assert.equal(store.get('group::one', 1100), null);
+    assert.equal(store.get('fastest::two', 1100).nodeName, 'Finland-1');
+});

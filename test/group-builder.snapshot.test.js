@@ -29,7 +29,7 @@ test('buildGroupConfig output matches snapshot fixture', () => {
     assert.deepEqual(out, expected);
 });
 
-test('buildGroupConfig adds fallback balancer and keeps base inbound ports', () => {
+test('buildGroupConfig uses a loopback outbound to preserve the fallback pool', () => {
     const base = {
         inbounds: [
             { tag: 'socks', port: 10808, protocol: 'socks' },
@@ -52,8 +52,83 @@ test('buildGroupConfig adds fallback balancer and keeps base inbound ports', () 
     assert.deepEqual(out.burstObservatory.subjectSelector, ['Main-1', 'LTE-1', 'LTE-2']);
     assert.equal(out.burstObservatory.pingConfig.sampling, 1);
     assert.equal(out.burstObservatory.pingConfig.timeout, '3s');
-    assert.equal(out.routing.balancers[0].fallbackTag, '_Fastest-fallback-balancer');
+    assert.equal(out.burstObservatory.pingConfig.connectivity, '');
+    assert.equal(out.burstObservatory.pingConfig.httpMethod, 'HEAD');
+    assert.equal(out.routing.balancers.length, 2);
+    assert.equal(out.routing.balancers[0].fallbackTag, '_Fastest-fallback-dispatch');
+    assert.equal(out.routing.balancers[1].fallbackTag, 'LTE-1');
     assert.deepEqual(out.routing.balancers[1].selector, ['LTE-1', 'LTE-2']);
+    assert.deepEqual(
+        out.outbounds.find((outbound) => outbound.tag === '_Fastest-fallback-dispatch'),
+        {
+            tag: '_Fastest-fallback-dispatch',
+            protocol: 'loopback',
+            settings: { inboundTag: '_Fastest-fallback-in' },
+        },
+    );
+    assert.deepEqual(out.routing.rules[0], {
+        type: 'field',
+        inboundTag: ['_Fastest-fallback-in'],
+        balancerTag: '_Fastest-fallback-balancer',
+    });
+});
+
+test('buildGroupConfig accepts custom burst observatory ping options', () => {
+    const out = buildGroupConfig({}, 'Fastest', [{ tag: 'Main-1', protocol: 'vless' }], {
+        probeUrl: 'https://example.com/ping',
+        probeConnectivity: 'https://example.com/connectivity',
+        probeInterval: '30s',
+        probeSampling: 3,
+        probeTimeout: '5s',
+        probeHttpMethod: 'GET',
+        strategy: 'leastPing',
+    });
+
+    assert.deepEqual(out.burstObservatory.pingConfig, {
+        destination: 'https://example.com/ping',
+        connectivity: 'https://example.com/connectivity',
+        interval: '30s',
+        sampling: 3,
+        timeout: '5s',
+        httpMethod: 'GET',
+    });
+});
+
+test('every observed balancer fallback resolves to a safe outbound', () => {
+    for (const strategy of ['leastPing', 'leastLoad']) {
+        for (const fallbackOutbounds of [
+            [],
+            [{ tag: 'Reserve-1', protocol: 'vless' }],
+            [
+                { tag: 'Reserve-1', protocol: 'vless' },
+                { tag: 'Reserve-2', protocol: 'vless' },
+            ],
+        ]) {
+            const out = buildGroupConfig({}, `${strategy}-group`, [
+                { tag: 'Main-1', protocol: 'vless' },
+                { tag: 'Main-2', protocol: 'vless' },
+            ], {
+                fallbackOutbounds,
+                probeUrl: 'https://example.com/ping',
+                probeInterval: '1m',
+                strategy,
+            });
+            const outboundTags = new Set(out.outbounds.map((outbound) => outbound.tag));
+            const outboundsByTag = new Map(out.outbounds.map((outbound) => [outbound.tag, outbound]));
+            const balancerTags = new Set(out.routing.balancers.map((balancer) => balancer.tag));
+
+            for (const balancer of out.routing.balancers) {
+                assert.ok(balancer.fallbackTag, `${strategy} balancer must have fallbackTag`);
+                assert.ok(outboundTags.has(balancer.fallbackTag), 'fallbackTag must resolve to an outbound');
+                assert.equal(balancerTags.has(balancer.fallbackTag), false, 'fallbackTag must not resolve to a balancer');
+                assert.notEqual(balancer.fallbackTag, 'direct', 'fallback must not leak traffic directly');
+                assert.notEqual(balancer.fallbackTag, 'block', 'fallback must not silently block traffic');
+                assert.notEqual(balancer.fallbackTag, out.outbounds[0].tag, 'fallback must not use the default outbound implicitly');
+                assert.notEqual(outboundsByTag.get(balancer.fallbackTag).protocol, 'freedom');
+                assert.notEqual(outboundsByTag.get(balancer.fallbackTag).protocol, 'blackhole');
+            }
+        }
+    }
 });
 
 test('buildGroupConfig emits leastPing strategy without leastLoad settings', () => {
@@ -68,6 +143,7 @@ test('buildGroupConfig emits leastPing strategy without leastLoad settings', () 
 
     assert.deepEqual(out.burstObservatory.subjectSelector, ['Germany-1', 'Germany-2']);
     assert.deepEqual(out.routing.balancers[0].strategy, { type: 'leastPing' });
+    assert.equal(out.routing.balancers[0].fallbackTag, 'Germany-1');
 });
 
 test('buildGroupConfig does not inherit per-server description fields from base config', () => {

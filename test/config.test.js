@@ -52,6 +52,10 @@ test('validateConfig accepts runtime and fastest-exclude options', () => {
         profile_mode: 'stable',
         admin_token: 'supersecret',
         fastest_probe_url: 'https://ya.ru',
+        probe_sampling: 1,
+        probe_timeout: '3s',
+        probe_connectivity_url: 'https://connectivitycheck.gstatic.com/generate_204',
+        probe_http_method: 'HEAD',
         fastest_exclude_groups: ['🇷🇺 White List'],
         fastest_fallback: ['🇪🇺 LTE'],
         node_stats_exclude: ['🇷🇺 White List'],
@@ -70,6 +74,15 @@ test('validateConfig accepts runtime and fastest-exclude options', () => {
         token_limiter_max_entries: 5000,
         token_limiter_cleanup_batch: 200,
         ready_success_window_sec: 300,
+        protection_enabled: true,
+        protection_failures: 2,
+        protection_release_successes: 3,
+        protection_isolation_ttl_sec: 300,
+        protection_latency_threshold_ms: 1500,
+        protection_min_available_nodes: 1,
+        emergency_fallback_enabled: true,
+        emergency_fallback_max_nodes: 1,
+        attack_nodes: [{ node: 'Germany-1', reason: 'ddos', source: 'admin', expires_at: '2030-01-01T00:00:00.000Z' }],
     };
 
     assert.deepEqual(validateConfig(cfg), cfg);
@@ -133,4 +146,12 @@ test('validateConfig bounds smoothing alpha to 0..1', () => {
         () => validateConfig({ balancer_smoothing_alpha: 1.5 }),
         /balancer_smoothing_alpha must be <= 1/,
     );
+});
+
+test('validateConfig rejects malformed protection settings', () => {
+    assert.throws(() => validateConfig({ probe_http_method: 'POST' }), /probe_http_method/);
+    assert.throws(() => validateConfig({ probe_connectivity_url: 'connectivity.test' }), /probe_connectivity_url/);
+    assert.throws(() => validateConfig({ protection_failures: 0 }), /protection_failures/);
+    assert.throws(() => validateConfig({ attack_nodes: [{ node: '' }] }), /attack_nodes/);
+    assert.throws(() => validateConfig({ attack_nodes: [{ node: 'A', expires_at: 'tomorrow' }] }), /expires_at/);
 });

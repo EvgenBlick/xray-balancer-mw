@@ -15,6 +15,8 @@ All endpoints below require `x-admin-token` header:
 - `/admin/groups` (`GET` current runtime groups, `PUT` update/persist groups and mutable settings)
 - `/admin/quarantine` (`GET` list, `POST` add `{ "node": "name" }`)
 - `/admin/quarantine/{node}` (`DELETE` remove)
+- `/admin/attack-mode` (`GET` state, `POST` isolate `{ "node": "name", "reason": "ddos", "ttl_sec": 1800 }`)
+- `/admin/attack-mode/{node}` (`DELETE` release)
 
 Admin endpoints are also rate-limited (`admin_rate_limit_per_minute`, `admin_rate_limit_burst_10s`).
 
@@ -63,6 +65,19 @@ Admin endpoints are also rate-limited (`admin_rate_limit_per_minute`, `admin_rat
 - Add node to quarantine via `/admin/quarantine`.
 - Verify `quarantine_count` in `/admin/quarantine` or `/admin/debug/stats`.
 - Remove when node is healthy again.
+
+### Node is under attack
+- Prefer `/admin/attack-mode` over permanent quarantine: it records a reason and expiry.
+- Isolation immediately clears subscription cache and sticky assignments for the node.
+- Existing client connections are not migrated; after disconnect, Xray selects an observed reserve outbound.
+- If every outbound is unavailable, middleware returns `503 NO_HEALTHY_NODES` and does not fail open to the raw subscription.
+- Keep `sticky_mode: prefer`; `pin` removes client-side reserve outbounds.
+
+## DDoS Boundary
+- Middleware provides failover and control-plane load shedding, not packet scrubbing.
+- Put the HTTPS subscription domain behind a CDN/WAF and restrict the origin where possible.
+- Use provider L3/L4 anti-DDoS for Reality/TCP/UDP node addresses.
+- Keep reserve nodes in a different provider or ASN and verify spare capacity before enabling automatic isolation.
 
 ## Safe Defaults
 - `profile_mode: stable`
