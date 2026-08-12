@@ -98,6 +98,23 @@ cp config.json.example config.json
 docker compose up -d --build
 ```
 
+## Автопереключение Wi-Fi / LTE (Fallback)
+
+Если у вас есть отдельный хост или группа нод под мобильные сети (LTE), укажите эту группу в `fastest_fallback`:
+
+```json
+{
+  "fastest_group": true,
+  "fastest_fallback": ["📱 LTE Special"],
+  "groups": {
+    "🇩🇪 Germany": ["Germany"],
+    "📱 LTE Special": ["LTE"]
+  }
+}
+```
+
+Клиент в группе `🏁 Самые быстрые` будет использовать основные ноды (Wi-Fi). При смене сети на LTE или при блокировке Wi-Fi нод провайдером ядро Xray/Sing-box на устройстве клиента мгновенно переключает трафик на fallback-ноды из группы `📱 LTE Special` через встроенный `fallbackTag` и `burstObservatory`.
+
 ## Reverse Proxy
 
 Обычно middleware ставят перед subscription-page и отправляют в него только xray-клиентов.
