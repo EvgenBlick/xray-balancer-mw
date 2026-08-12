@@ -167,6 +167,14 @@ test('buildGroupConfig does not inherit per-server description fields from base 
     assert.deepEqual(out.extraField, { x: 1 });
 });
 
+test('buildGroupConfig applies custom groupDescription when provided in options', () => {
+    const base = { remarks: 'base', description: 'node-specific description' };
+    const out = buildGroupConfig(base, '🇪🇺 Europe', [{ tag: 'Germany-1', protocol: 'vless' }], {
+        groupDescription: 'Кастомное описание группы Европа',
+    });
+    assert.equal(out.description, 'Кастомное описание группы Европа');
+});
+
 test('buildGroupConfig does not inherit stale observatory from base config', () => {
     const out = buildGroupConfig({
         observatory: { subjectSelector: ['old-node'] },
