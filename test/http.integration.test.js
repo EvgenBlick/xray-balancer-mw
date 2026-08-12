@@ -1139,6 +1139,51 @@ test('automatic protection isolates a repeatedly disconnected node but preserves
     assert.match(body, /Germany-2/);
 });
 
+test('fastest group keeps marked reserve nodes out of the primary pool', async (t) => {
+    const upstream = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify([{
+            remarks: 'nodes',
+            outbounds: [
+                { tag: 'Germany-1', protocol: 'vless', settings: { vnext: [{ address: 'de.example.com', port: 443 }] } },
+                { tag: 'Finland-1', protocol: 'vless', settings: { vnext: [{ address: 'fi.example.com', port: 443 }] } },
+                { tag: 'Germany MOBILE-RESERVE #1', protocol: 'vless', settings: { vnext: [{ address: 'lte.example.com', port: 443 }] } },
+            ],
+        }]));
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+    const balancer = await startBalancer(t, {
+        upstreamPort,
+        strategy: 'leastPing',
+        fastest_group: true,
+        fastest_group_name: 'Fastest',
+        fastest_fallback: ['LTE Reserve'],
+        groups: {
+            Germany: ['Germany'],
+            Finland: ['Finland'],
+            'LTE Reserve': ['MOBILE-RESERVE'],
+        },
+    });
+
+    const response = await fetch(`${balancer.baseUrl}/fastest-fallback-token`);
+    assert.equal(response.status, 200);
+    const configs = await response.json();
+    const fastest = configs.find((item) => item.remarks === 'Fastest');
+    assert.ok(fastest);
+    assert.deepEqual(fastest.routing.balancers[0].selector, ['Germany-1', 'Finland-1']);
+    assert.equal(fastest.routing.balancers[0].fallbackTag, 'Germany MOBILE-RESERVE #1');
+    assert.deepEqual(fastest.burstObservatory.subjectSelector, [
+        'Germany-1',
+        'Finland-1',
+        'Germany MOBILE-RESERVE #1',
+    ]);
+
+    const germany = configs.find((item) => item.remarks === 'Germany');
+    assert.ok(germany);
+    assert.doesNotMatch(JSON.stringify(germany), /MOBILE-RESERVE/);
+});
+
 test('normal groups receive a cross-group emergency fallback', async (t) => {
     const upstream = http.createServer((req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });

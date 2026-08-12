@@ -98,22 +98,27 @@ cp config.json.example config.json
 docker compose up -d --build
 ```
 
-## Автопереключение Wi-Fi / LTE (Fallback)
+## Резерв для fastest-группы (Xray)
 
-Если у вас есть отдельный хост или группа нод под мобильные сети (LTE), укажите эту группу в `fastest_fallback`:
+Если часть нод предназначена для резервного доступа через другого оператора или маршрут, добавьте в их названия уникальный маркер, например `MOBILE-RESERVE`, и укажите соответствующую группу в `fastest_fallback`:
 
 ```json
 {
+  "strategy": "leastPing",
+  "probe_interval": "30s",
+  "probe_timeout": "3s",
   "fastest_group": true,
-  "fastest_fallback": ["📱 LTE Special"],
+  "fastest_fallback": ["📱 LTE Reserve"],
   "groups": {
     "🇩🇪 Germany": ["Germany"],
-    "📱 LTE Special": ["LTE"]
+    "📱 LTE Reserve": ["MOBILE-RESERVE"]
   }
 }
 ```
 
-Клиент в группе `🏁 Самые быстрые` будет использовать основные ноды (Wi-Fi). При смене сети на LTE или при блокировке Wi-Fi нод провайдером ядро Xray/Sing-box на устройстве клиента мгновенно переключает трафик на fallback-ноды из группы `📱 LTE Special` через встроенный `fallbackTag` и `burstObservatory`.
+Например, нода `Germany MOBILE-RESERVE #1` попадёт в резерв, а обычные Germany-ноды останутся в основном пуле. В профиле `🏁 Самые быстрые` Xray использует резерв через `fallbackTag`, только когда `burstObservatory` признает все основные ноды недоступными.
+
+Это проверка доступности, а не определение типа сети устройства. Переключение зависит от `probe_interval`, `probe_timeout` и результатов проверки; существующим соединениям может потребоваться переподключение. Настройка применяется к выдаваемому middleware XRAY-JSON. Для нативных Sing-box-профилей нужен отдельный шаблон Sing-box.
 
 ## Reverse Proxy
 
@@ -161,7 +166,7 @@ https://sub.example.com {
 
 ```json
 {
-  "fastest_fallback": ["🇪🇺 Europe LTE"]
+  "fastest_fallback": ["📱 LTE Reserve"]
 }
 ```
 
@@ -169,7 +174,7 @@ https://sub.example.com {
 
 ```json
 {
-  "node_stats_exclude": ["🇪🇺 Europe LTE"]
+  "node_stats_exclude": ["📱 LTE Reserve"]
 }
 ```
 
