@@ -15,7 +15,7 @@
     "fastest_group": true,
     "fastest_group_name": "🏁 🇪🇺 Самые быстрые",
     "fastest_exclude_groups": [],
-    "fastest_fallback": ["📱 LTE Special"],
+    "fastest_fallback": ["📱 LTE Reserve"],
     "node_stats_exclude": [],
     "expand_groups_to_nodes": [],
     "hidden_groups": [],
@@ -85,6 +85,6 @@
         "🇫🇮 Finland": ["Finland"],
         "🇩🇪 Germany": ["German"],
         "🇳🇱 Netherlands": ["Netherlands"],
-        "📱 LTE Special": ["LTE"]
+        "📱 LTE Reserve": ["MOBILE-RESERVE"]
     }
 }
