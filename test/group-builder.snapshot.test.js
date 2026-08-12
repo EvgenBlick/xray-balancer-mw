@@ -146,25 +146,37 @@ test('buildGroupConfig emits leastPing strategy without leastLoad settings', () 
     assert.equal(out.routing.balancers[0].fallbackTag, 'Germany-1');
 });
 
-test('buildGroupConfig does not inherit per-server description fields from base config', () => {
+test('buildGroupConfig does not inherit per-server title/description fields from base config', () => {
     const base = {
         remarks: 'base',
+        title: 'node-1 title',
+        ps: 'node-1 ps',
+        name: 'node-1 name',
+        remark: 'node-1 remark',
         description: 'node-specific description',
         serverDescription: 'node-specific server description',
         server_description: 'node specific snake case description',
         extraField: { x: 1 },
     };
 
-    const out = buildGroupConfig(base, '🇪🇺 Europe', [{ tag: 'Germany-1', protocol: 'vless' }], {
+    const out = buildGroupConfig(base, '🇪🇺 Europe', [{ tag: 'Germany-1', protocol: 'vless', title: 'Germany-1 Title' }], {
         probeUrl: 'https://example.com/ping',
         probeInterval: '3m',
         strategy: 'leastLoad',
     });
 
+    assert.equal(out.title, undefined);
+    assert.equal(out.ps, undefined);
+    assert.equal(out.name, undefined);
+    assert.equal(out.remark, undefined);
     assert.equal(out.description, undefined);
     assert.equal(out.serverDescription, undefined);
     assert.equal(out.server_description, undefined);
     assert.deepEqual(out.extraField, { x: 1 });
+    assert.equal(out.outbounds[0].tag, 'proxy');
+    assert.equal(out.outbounds[0].title, undefined);
+    assert.equal(out.outbounds[1].tag, 'Germany-1');
+    assert.equal(out.outbounds[1].title, 'Germany-1 Title');
 });
 
 test('buildGroupConfig applies custom groupDescription when provided in options', () => {
