@@ -1433,6 +1433,11 @@ function collectAllProxyOutbounds(configArray) {
                 }
             }
             cloned.tag = tag;
+            if (cfg.description && !cloned.description) cloned.description = cfg.description;
+            if (cfg.serverDescription && !cloned.serverDescription) cloned.serverDescription = cfg.serverDescription;
+            if (cfg.server_description && !cloned.server_description) cloned.server_description = cfg.server_description;
+            if (cfg.title && !cloned.title) cloned.title = cfg.title;
+            if (cfg.ps && !cloned.ps) cloned.ps = cfg.ps;
             seenTags.add(tag);
             allOutbounds.push(cloned);
         }
