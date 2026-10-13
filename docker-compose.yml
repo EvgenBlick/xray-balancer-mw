@@ -13,6 +13,8 @@ services:
     pids_limit: 100
     mem_limit: 512m
     cpus: 1.0
+    ports:
+      - "127.0.0.1:4100:4100"
     logging:
       driver: json-file
       options:

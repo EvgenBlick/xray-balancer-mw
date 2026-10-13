@@ -1,7 +1,10 @@
 node_modules/
-config.json
+config.json*
+*.save
+*.broken*
 *.bak*
 *.log
-.env
+.env*
 .DS_Store
 **/.DS_Store
+runtime/

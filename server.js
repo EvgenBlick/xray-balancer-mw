@@ -1756,6 +1756,7 @@ function collectAllProxyOutbounds(configArray) {
             if (cfg.description && !cloned.description) cloned.description = cfg.description;
             if (cfg.serverDescription && !cloned.serverDescription) cloned.serverDescription = cfg.serverDescription;
             if (cfg.server_description && !cloned.server_description) cloned.server_description = cfg.server_description;
+            if (cfg.meta?.serverDescription && !cloned.serverDescription) cloned.serverDescription = cfg.meta.serverDescription;
             if (cfg.title && !cloned.title) cloned.title = cfg.title;
             if (cfg.ps && !cloned.ps) cloned.ps = cfg.ps;
             const proxyTag = cloned.proxySettings?.tag;
@@ -3361,7 +3362,7 @@ const server = http.createServer(async (req, res) => {
                 probeConnectivity: runtime.probeConnectivityUrl,
                 probeHttpMethod: runtime.probeHttpMethod,
                 strategy: STRATEGY,
-                groupDescription: (GROUP_DESCRIPTIONS && GROUP_DESCRIPTIONS[fastestGroupName]) || '',
+                groupDescription: (GROUP_DESCRIPTIONS && (GROUP_DESCRIPTIONS[fastestGroupName] || GROUP_DESCRIPTIONS['fastest'] || GROUP_DESCRIPTIONS[DEFAULT_FASTEST_GROUP_NAME])) || config.fastest_group_description || '',
             });
             resultConfigs.push(fastestConfig);
             logger.info('group_fastest', {
@@ -3432,7 +3433,7 @@ const server = http.createServer(async (req, res) => {
                 probeConnectivity: runtime.probeConnectivityUrl,
                 probeHttpMethod: runtime.probeHttpMethod,
                 strategy: STRATEGY,
-                groupDescription: (GROUP_DESCRIPTIONS && (GROUP_DESCRIPTIONS[configName] || GROUP_DESCRIPTIONS[groupName])) || '',
+                groupDescription: (GROUP_DESCRIPTIONS && (GROUP_DESCRIPTIONS[configName] || GROUP_DESCRIPTIONS[groupName])) || (entry.kind === 'node' && selectedGroupOutbounds[0] ? (selectedGroupOutbounds[0].serverDescription || selectedGroupOutbounds[0].description || '') : ''),
             });
             resultConfigs.push(groupConfig);
 
