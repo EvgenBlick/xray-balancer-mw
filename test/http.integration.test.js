@@ -2002,3 +2002,50 @@ test('error fallback serves the last config to a client that changed IP', async 
     assert.equal(await second.text(), firstBody);
     assert.ok(upstreamHits >= 2, 'the new IP still tried upstream first');
 });
+
+test('admin group status aggregates xray-checker nodes per issued group', async (t) => {
+    const now = Math.floor(Date.now() / 1000);
+    const checker = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, data: [
+            { name: 'Germany | proxy', groupName: 'Germany', online: true, latencyMs: 50, lastCheck: now },
+            { name: 'Germany | de-1', groupName: 'Germany', online: true, latencyMs: 120, lastCheck: now },
+            { name: 'Germany | de-2', groupName: 'Germany', online: false, latencyMs: 0, lastCheck: now },
+            { name: 'France | fr-1', groupName: 'France', online: false, latencyMs: 0, lastCheck: now },
+            { name: 'Other | x', groupName: 'Not issued', online: true, latencyMs: 10, lastCheck: now },
+        ] }));
+    });
+    const checkerPort = await listenOnRandomPort(checker);
+    t.after(() => closeServer(checker));
+
+    const balancer = await startBalancer(t, {
+        groups: { Germany: ['Germany'], France: ['France'], Spain: ['Spain'] },
+        checker_url: `http://127.0.0.1:${checkerPort}`,
+    });
+    const unauthorized = await fetch(`${balancer.baseUrl}/admin/group-status`);
+    assert.equal(unauthorized.status, 401);
+
+    const response = await fetch(`${balancer.baseUrl}/admin/group-status`, {
+        headers: { 'X-Admin-Token': 'integration-admin-token' },
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    const byName = Object.fromEntries(body.groups.map((group) => [group.name, group]));
+    assert.deepEqual(Object.keys(byName), ['Germany', 'France'], 'groups without checked nodes are not issued');
+    assert.equal(byName.Germany.state, 'degraded');
+    assert.equal(byName.Germany.online, true);
+    assert.equal(byName.Germany.nodes_online, 1);
+    assert.equal(byName.Germany.nodes_total, 2);
+    assert.equal(byName.Germany.best_latency_ms, 120);
+    assert.equal(byName.France.state, 'down');
+    assert.ok(!JSON.stringify(body).includes('de-1'), 'node names are not exposed');
+});
+
+test('admin group status is 404 when no checker is configured', async (t) => {
+    const balancer = await startBalancer(t, {});
+    const response = await fetch(`${balancer.baseUrl}/admin/group-status`, {
+        headers: { 'X-Admin-Token': 'integration-admin-token' },
+    });
+    assert.equal(response.status, 404);
+    assert.equal((await response.json()).code, 'CHECKER_NOT_CONFIGURED');
+});

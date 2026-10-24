@@ -438,6 +438,22 @@ curl -fsS -A 'Mozilla/5.0' -H 'Accept: text/html' \
 }
 ```
 
+### Доступность групп серверов (xray-checker)
+
+Если рядом запущен [xray-checker](https://github.com/kutovoys/xray-checker) (v1.3+, `SUBSCRIPTION_JSON_FORMAT=true`, подписка через этот middleware), укажите его адрес в `checker_url` (или `CHECKER_URL`). Тогда `GET /admin/group-status` (с `X-Admin-Token`) вернёт состояние каждой выдаваемой группы: группа доступна, пока отвечает хотя бы одна её нода. Имена нод не раскрываются.
+
+```json
+{ "checker_url": "http://xray-checker:2112" }
+```
+
+```json
+{ "status": "ok", "source": "xray-checker", "groups": [
+  { "name": "🇩🇪 Germany", "state": "up", "online": true, "nodes_online": 3, "nodes_total": 3, "best_latency_ms": 210, "last_check": "2026-10-24T16:30:00.000Z" }
+] }
+```
+
+`state`: `up` — все ноды отвечают, `degraded` — часть, `down` — ни одна, `unknown` — нет свежих данных (старше 15 минут). Группы, по которым у чекера нет ни одной ноды (они не выдаются в подписке), не показываются.
+
 ### Привязать DNS-записи нод к профилям
 
 Если в шаблоне есть `dns.hosts` для доменов нод, каждый профиль может получать только записи тех нод, которые в нём используются. Сервисные домены не трогаются, а профили, где есть только исключённые адреса (например, LTE/CDN-мосты), остаются без изменений. По умолчанию выключено.

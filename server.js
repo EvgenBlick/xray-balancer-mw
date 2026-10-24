@@ -288,6 +288,10 @@ let HIDDEN_GROUPS = [];
 let HIDDEN_NODES = [];
 const DEFAULT_FASTEST_GROUP_NAME = '🏁 🇪🇺 Самые быстрые';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || config.admin_token || '';
+// Optional xray-checker (https://github.com/kutovoys/xray-checker) base URL for /admin/group-status.
+const CHECKER_URL = String(process.env.CHECKER_URL || config.checker_url || '').replace(/\/+$/, '');
+const CHECKER_CACHE_MS = 30000;
+const CHECKER_STALE_MS = 15 * 60 * 1000;
 const NODE_DNS_SCOPE = {
     serviceHostnames: config.node_dns_scope?.service_hostnames || [],
     nodeDomainSuffixes: config.node_dns_scope?.node_domain_suffixes || [],
@@ -1959,6 +1963,60 @@ function buildAdminHostCatalog(hosts) {
         });
 }
 
+let checkerCache = { at: 0, proxies: null };
+
+async function fetchCheckerProxies() {
+    if (checkerCache.proxies && Date.now() - checkerCache.at < CHECKER_CACHE_MS) return checkerCache.proxies;
+    const response = await fetchUrl(`${CHECKER_URL}/api/v1/public/proxies`, { Accept: 'application/json' });
+    if (response.status !== 200) throw new Error(`checker returned ${response.status}`);
+    const body = JSON.parse(response.body);
+    const proxies = Array.isArray(body) ? body : body?.data;
+    if (!Array.isArray(proxies)) throw new Error('checker response has no proxy list');
+    checkerCache = { at: Date.now(), proxies };
+    return proxies;
+}
+
+function checkTimeMs(value) {
+    const n = Number(value) || 0;
+    return n > 1e12 ? n : n * 1000;
+}
+
+// Availability per issued group: a group is up while at least one of its nodes answers. Only configured groups
+// the checker actually saw are reported (a group without hosts is not issued); node names are not exposed.
+// The duplicate "proxy" outbound is not a node.
+function buildGroupStatus(proxies, now = Date.now()) {
+    const hidden = new Set([...HIDDEN_GROUPS, ...EXPAND_GROUPS_TO_NODES]);
+    const names = [
+        ...(config.fastest_group !== false ? [config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME] : []),
+        ...Object.keys(GROUPS),
+    ].filter((name) => !hidden.has(name));
+    const byGroup = new Map(names.map((name) => [name, []]));
+    for (const proxy of proxies) {
+        const group = byGroup.get(String(proxy.groupName || ''));
+        if (!group || String(proxy.name || '').endsWith(' | proxy')) continue;
+        group.push(proxy);
+    }
+    return names.filter((name) => byGroup.get(name).length > 0).map((name) => {
+        const nodes = byGroup.get(name);
+        const online = nodes.filter((node) => node.online === true);
+        const lastCheck = Math.max(0, ...nodes.map((node) => checkTimeMs(node.lastCheck)));
+        let state = 'unknown';
+        if (nodes.length > 0 && lastCheck > 0 && now - lastCheck <= CHECKER_STALE_MS) {
+            state = online.length === 0 ? 'down' : (online.length === nodes.length ? 'up' : 'degraded');
+        }
+        const latencies = online.map((node) => Number(node.latencyMs)).filter((ms) => Number.isFinite(ms) && ms > 0);
+        return {
+            name,
+            state,
+            online: state === 'up' || state === 'degraded',
+            nodes_online: online.length,
+            nodes_total: nodes.length,
+            best_latency_ms: latencies.length > 0 ? Math.min(...latencies) : null,
+            last_check: lastCheck > 0 ? new Date(lastCheck).toISOString() : null,
+        };
+    });
+}
+
 function sendMethodNotAllowed(res, requestId, allowedMethods) {
     res.writeHead(405, {
         'Content-Type': 'application/json',
@@ -2444,6 +2502,31 @@ async function handleRequest(req, res) {
 
     const adminDebugTokenMatch = pathname.match(/^\/admin\/debug\/token\/([a-zA-Z0-9_-]+)$/);
     const debugTokenValue = adminDebugTokenMatch?.[1] || null;
+
+    if (pathname === '/admin/group-status') {
+        if (!enforceAdminAccess(req, res, requestId, clientIp, pathname)) {
+            return;
+        }
+        if (req.method !== 'GET') {
+            sendMethodNotAllowed(res, requestId, ['GET']);
+            return;
+        }
+        if (!CHECKER_URL) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'CHECKER_NOT_CONFIGURED', request_id: requestId }));
+            return;
+        }
+        try {
+            const groups = buildGroupStatus(await fetchCheckerProxies());
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'ok', request_id: requestId, source: 'xray-checker', groups }));
+        } catch (err) {
+            logger.warn('checker_unavailable', { request_id: requestId, error: err.message });
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'CHECKER_UNAVAILABLE', request_id: requestId }));
+        }
+        return;
+    }
 
     if (pathname === '/admin/node-stats') {
         if (!enforceAdminAccess(req, res, requestId, clientIp, pathname)) {

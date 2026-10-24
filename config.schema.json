@@ -18,6 +18,7 @@
     "probe_http_method": { "type": "string", "enum": ["HEAD", "GET"] },
     "probe_url": { "type": "string", "pattern": "^https?://" },
     "fastest_probe_url": { "type": "string", "pattern": "^https?://" },
+    "checker_url": { "type": "string", "pattern": "^https?://" },
     "node_dns_scope": {
       "type": "object",
       "additionalProperties": false,
