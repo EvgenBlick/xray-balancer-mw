@@ -121,6 +121,8 @@ docker compose up -d --build
 
 Например, нода `Germany MOBILE-RESERVE #1` попадёт в резерв, а обычные Germany-ноды останутся в основном пуле. В профиле `🏁 Самые быстрые` Xray использует резерв через `fallbackTag`, только когда `burstObservatory` признает все основные ноды недоступными.
 
+Основной пул fastest-профиля балансируется через `leastLoad`: по умолчанию ноды проверяются раз в 2 минуты (`probe_interval: "2m"`), `probe_timeout: "4s"`, `max_rtt: "1500ms"`, `tolerance: 0.25`. Эти значения задаются блоком `fastest_stability` (через `PUT /admin/groups` вместе с `settings_revision`) и не зависят от `strategy`/`probe_interval` обычных групп.
+
 Это проверка доступности, а не определение типа сети устройства. Переключение зависит от `probe_interval`, `probe_timeout` и результатов проверки; существующим соединениям может потребоваться переподключение. Настройка применяется к выдаваемому middleware XRAY-JSON. Для нативных Sing-box-профилей нужен отдельный шаблон Sing-box.
 
 ## Reverse Proxy и шаблоны Remnawave
@@ -433,6 +435,20 @@ curl -fsS -A 'Mozilla/5.0' -H 'Accept: text/html' \
 ```json
 {
   "hidden_nodes": ["Germany-3"]
+}
+```
+
+### Привязать DNS-записи нод к профилям
+
+Если в шаблоне есть `dns.hosts` для доменов нод, каждый профиль может получать только записи тех нод, которые в нём используются. Сервисные домены не трогаются, а профили, где есть только исключённые адреса (например, LTE/CDN-мосты), остаются без изменений. По умолчанию выключено.
+
+```json
+{
+  "node_dns_scope": {
+    "service_hostnames": ["sub.example.com", "panel.example.com"],
+    "node_domain_suffixes": [".example.com"],
+    "excluded_endpoints": ["lte.example.net"]
+  }
 }
 ```
 

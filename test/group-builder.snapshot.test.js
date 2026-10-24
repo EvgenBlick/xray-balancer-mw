@@ -386,3 +386,55 @@ test('buildGroupConfig does not inherit stale observatory from base config', () 
     assert.equal(out.observatory, undefined);
     assert.deepEqual(out.burstObservatory.subjectSelector, ['__xrb_01__:Germany-1']);
 });
+
+test('private destinations go direct before the QUIC block', () => {
+    const out = buildGroupConfig({}, 'Group', [{ tag: 'Node-1', protocol: 'vless' }], {
+        probeUrl: 'https://example.com/ping',
+        probeInterval: '2m',
+        strategy: 'leastPing',
+    });
+    const rules = out.routing.rules;
+    const domainRule = rules.findIndex((rule) => rule.domain?.includes('domain:lan'));
+    const ipRule = rules.findIndex((rule) => rule.ip?.includes('100.64.0.0/10'));
+    const quicBlock = rules.findIndex((rule) => rule.network === 'udp' && rule.port === '443');
+    assert.ok(domainRule >= 0 && ipRule >= 0 && quicBlock >= 0);
+    assert.ok(domainRule < quicBlock && ipRule < quicBlock);
+    for (const rule of rules) {
+        for (const domain of rule.domain || []) assert.ok(!domain.includes('*'), `glob in ${domain}`);
+    }
+});
+
+test('node DNS scoping trims unused node hosts only when configured', () => {
+    const base = {
+        dns: {
+            hosts: {
+                'a.nodes.example.com': '192.0.2.1',
+                'b.nodes.example.com': '192.0.2.2',
+                'sub.nodes.example.com': '192.0.2.3',
+            },
+        },
+    };
+    const outbounds = [{ tag: 'A', protocol: 'vless', settings: { vnext: [{ address: 'a.nodes.example.com', port: 443 }] } }];
+    const opts = { probeUrl: 'https://example.com/ping', probeInterval: '2m', strategy: 'leastPing' };
+
+    const untouched = buildGroupConfig(base, 'Group', outbounds, opts);
+    assert.deepEqual(Object.keys(untouched.dns.hosts).sort(), Object.keys(base.dns.hosts).sort());
+
+    const scoped = buildGroupConfig(base, 'Group', outbounds, {
+        ...opts,
+        nodeDnsScope: { serviceHostnames: ['SUB.nodes.example.com'], nodeDomainSuffixes: ['.nodes.example.com'] },
+    });
+    assert.deepEqual(Object.keys(scoped.dns.hosts).sort(), ['a.nodes.example.com', 'sub.nodes.example.com']);
+});
+
+test('Auto group defaults to leastLoad probing every two minutes', () => {
+    const { applyFastestStability } = require('../lib/fastest-stability');
+    const cfg = buildGroupConfig({}, 'Auto', [{ tag: 'A', protocol: 'vless' }, { tag: 'B', protocol: 'vless' }], {
+        probeUrl: 'https://example.com/ping',
+        probeInterval: '30s',
+        strategy: 'leastPing',
+    });
+    applyFastestStability(cfg);
+    assert.equal(cfg.burstObservatory.pingConfig.interval, '2m');
+    assert.equal(cfg.routing.balancers[0].strategy.type, 'leastLoad');
+});

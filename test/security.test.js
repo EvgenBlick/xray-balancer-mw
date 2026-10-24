@@ -6,7 +6,7 @@ const { normalizeRequestId, redactTokenPath, sanitizeClientMetadata } = require(
 
 test('redactTokenPath masks subscription token', () => {
     const out = redactTokenPath('/GMfWZNmbtqyR4fgk');
-    assert.equal(out, '/GMfW...4fgk');
+    assert.equal(out, '/GMfW...');
 });
 
 test('sanitizeClientMetadata does not leak device details', () => {

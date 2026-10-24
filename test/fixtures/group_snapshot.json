@@ -75,6 +75,37 @@
     "rules": [
       {
         "type": "field",
+        "domain": [
+          "full:localhost",
+          "domain:local",
+          "domain:localdomain",
+          "domain:lan",
+          "domain:internal",
+          "domain:home.arpa"
+        ],
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "ip": [
+          "0.0.0.0/8",
+          "10.0.0.0/8",
+          "100.64.0.0/10",
+          "127.0.0.0/8",
+          "169.254.0.0/16",
+          "172.16.0.0/12",
+          "192.168.0.0/16",
+          "224.0.0.0/4",
+          "255.255.255.255/32",
+          "::1/128",
+          "fc00::/7",
+          "fe80::/10",
+          "ff00::/8"
+        ],
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
         "network": "udp",
         "port": "443",
         "outboundTag": "block"
@@ -83,33 +114,6 @@
         "type": "field",
         "protocol": [
           "bittorrent"
-        ],
-        "outboundTag": "direct"
-      },
-      {
-        "type": "field",
-        "domain": [
-          "localhost",
-          "localhost.localdomain",
-          "local",
-          "*.local",
-          "*.localdomain",
-          "*.lan",
-          "*.internal"
-        ],
-        "outboundTag": "direct"
-      },
-      {
-        "type": "field",
-        "ip": [
-          "127.0.0.0/8",
-          "10.0.0.0/8",
-          "172.16.0.0/12",
-          "192.168.0.0/16",
-          "169.254.0.0/16",
-          "::1/128",
-          "fc00::/7",
-          "fe80::/10"
         ],
         "outboundTag": "direct"
       },

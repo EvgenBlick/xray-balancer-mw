@@ -1933,3 +1933,72 @@ test('negative subscription responses are cached briefly', async (t) => {
     assert.equal(await second.text(), 'missing');
     assert.equal(upstreamHits, 1);
 });
+
+test('host bindings to hosts deleted in the panel are skipped when the catalog is loaded', async (t) => {
+    const panel = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            response: [{ uuid: 'uuid-de', remark: 'Germany Node', address: 'de.example.com', port: 443, isDisabled: false }],
+        }));
+    });
+    const panelPort = await listenOnRandomPort(panel);
+    t.after(() => closeServer(panel));
+
+    const upstream = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify([{
+            remarks: 'nodes',
+            outbounds: [
+                { tag: 'Germany Node', protocol: 'vless', settings: { vnext: [{ address: 'de.example.com', port: 443 }] } },
+                { tag: 'France', protocol: 'vless', settings: { vnext: [{ address: 'fr.example.com', port: 443 }] } },
+            ],
+        }]));
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+
+    const balancer = await startBalancer(t, {
+        upstreamPort,
+        groups: { Germany: [], France: ['France'] },
+        group_hosts: { Germany: ['uuid-de', 'uuid-deleted'], France: [] },
+    }, {
+        API_TOKEN: 'integration-api-token',
+        REMNAWAVE_URL: `http://127.0.0.1:${panelPort}`,
+    });
+
+    const response = await fetch(`${balancer.baseUrl}/uuid-stale-binding`);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    const germany = body.find((config) => config.remarks === 'Germany');
+    assert.ok(germany, 'Germany group is still issued');
+    const addresses = germany.outbounds.map((outbound) => outbound.settings?.vnext?.[0]?.address).filter(Boolean);
+    assert.ok(addresses.includes('de.example.com'));
+    assert.ok(!addresses.includes('fr.example.com'), 'other groups do not leak in');
+});
+
+test('error fallback serves the last config to a client that changed IP', async (t) => {
+    let failing = false;
+    let upstreamHits = 0;
+    const upstream = http.createServer((req, res) => {
+        upstreamHits += 1;
+        if (failing) {
+            req.socket.destroy();
+            return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(validXrayPayload());
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+    const balancer = await startBalancer(t, { upstreamPort, trust_x_forwarded_for: true });
+
+    const first = await fetch(`${balancer.baseUrl}/roaming`, { headers: { 'X-Forwarded-For': '198.51.100.20' } });
+    assert.equal(first.status, 200);
+    const firstBody = await first.text();
+
+    failing = true;
+    const second = await fetch(`${balancer.baseUrl}/roaming`, { headers: { 'X-Forwarded-For': '198.51.100.21' } });
+    assert.equal(second.status, 200);
+    assert.equal(await second.text(), firstBody);
+    assert.ok(upstreamHits >= 2, 'the new IP still tried upstream first');
+});

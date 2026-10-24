@@ -1,3 +1,4 @@
+const { applyFastestStability, CAPABILITY: FASTEST_STABILITY_CAPABILITY } = require('./lib/fastest-stability');
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
@@ -14,6 +15,7 @@ const {
     matchGroup,
 } = require('./lib/balancing');
 const { createCircuitBreakerRegistry, createKeyedRateLimiter, createRateLimiter, createTokenCache } = require('./lib/runtime');
+const { hostWireFingerprint } = require('./lib/host-wire-fingerprint');
 const { buildLogger } = require('./lib/log');
 const { resolveProfile } = require('./lib/profile');
 const { classifyUpstreamPayload } = require('./lib/upstream-contract');
@@ -35,6 +37,7 @@ const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json
 const CONFIG_RUNTIME_PATH = process.env.CONFIG_RUNTIME_PATH || '';
 const CONFIG_RUNTIME_BACKUP_PATH = CONFIG_RUNTIME_PATH ? `${CONFIG_RUNTIME_PATH}.bak` : '';
 const MUTABLE_CONFIG_KEYS = [
+    'fastest_stability',
     'groups',
     'group_descriptions',
     'group_hosts',
@@ -285,6 +288,11 @@ let HIDDEN_GROUPS = [];
 let HIDDEN_NODES = [];
 const DEFAULT_FASTEST_GROUP_NAME = '🏁 🇪🇺 Самые быстрые';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || config.admin_token || '';
+const NODE_DNS_SCOPE = {
+    serviceHostnames: config.node_dns_scope?.service_hostnames || [],
+    nodeDomainSuffixes: config.node_dns_scope?.node_domain_suffixes || [],
+    excludedEndpoints: config.node_dns_scope?.excluded_endpoints || [],
+};
 const WARMUP_TOKENS = Array.isArray(config.warmup_tokens) ? config.warmup_tokens : [];
 let QUARANTINE_NODES = [];
 let AUTO_QUARANTINE_NODES = [];
@@ -312,7 +320,10 @@ function panelHeaders() {
 let nodeStatsCache = {};
 const nodeHealthChecker = createHealthChecker({ maxHistory: 10 });
 let hostCatalogCache = [];
+let lastUnresolvedForcedRefreshAt = 0;
+let lastUnresolvedWarnAt = 0;
 let rawHostCatalogCache = [];
+let lastHostWireFingerprint = hostWireFingerprint([]);
 let lastHostCatalogRefreshAt = 0;
 let lastHostCatalogAttemptAt = 0;
 let lastHostCatalogError = null;
@@ -324,6 +335,10 @@ let lastNodeStatsError = null;
 let nodeStatsRefreshInFlight = null;
 const autoQuarantineState = new Map();
 const subscriptionCache = createTokenCache(CACHE_TTL_SEC, CACHE_MAX_ENTRIES, {
+    maxBytes: CACHE_MAX_BYTES,
+    maxItemBytes: CACHE_MAX_ITEM_BYTES,
+});
+const fallbackSubscriptionCache = createTokenCache(CACHE_TTL_SEC, CACHE_MAX_ENTRIES, {
     maxBytes: CACHE_MAX_BYTES,
     maxItemBytes: CACHE_MAX_ITEM_BYTES,
 });
@@ -507,6 +522,7 @@ applyMutableRuntimeConfig(config);
 
 function clearSubscriptionCache(reason, requestId) {
     const removed = subscriptionCache.clear();
+    fallbackSubscriptionCache.clear();
     subscriptionCacheGeneration += 1;
     runtimeStats.cache_invalidations_total += 1;
     logger.info('subscription_cache_cleared', {
@@ -1252,7 +1268,89 @@ function readJsonBody(req, maxBytes = 512 * 1024) {
     });
 }
 
+// Shared body of GET and PUT /admin/groups; the cabinet reads these fields.
+function adminGroupsPayload(requestId) {
+    const runtime = getRuntimeConfig();
+    return {
+        status: 'ok',
+        request_id: requestId,
+        groups: GROUPS,
+        group_descriptions: GROUP_DESCRIPTIONS,
+        group_hosts: GROUP_HOSTS,
+        strategy: STRATEGY,
+        fastest_group: config.fastest_group !== false,
+        fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
+        fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
+        fastest_fallback: FASTEST_FALLBACK_GROUPS,
+        node_stats_exclude: NODE_STATS_EXCLUDE_GROUPS,
+        expand_groups_to_nodes: EXPAND_GROUPS_TO_NODES,
+        hidden_groups: HIDDEN_GROUPS,
+        hidden_nodes: HIDDEN_NODES,
+        quarantine_nodes: QUARANTINE_NODES,
+        auto_quarantine_nodes: AUTO_QUARANTINE_NODES,
+        attack_nodes: ATTACK_NODES,
+        auto_quarantine_enabled: runtime.autoQuarantineEnabled,
+        auto_quarantine_failures: runtime.autoQuarantineFailures,
+        auto_quarantine_release_successes: runtime.autoQuarantineReleaseSuccesses,
+        auto_quarantine_max_nodes: runtime.autoQuarantineMaxNodes,
+        auto_drain_enabled: runtime.autoDrainEnabled,
+        auto_drain_failures: runtime.autoDrainFailures,
+        auto_drain_release_successes: runtime.autoDrainReleaseSuccesses,
+        auto_drain_load_threshold: runtime.autoDrainLoadThreshold,
+        auto_drain_score_penalty: runtime.autoDrainScorePenalty,
+        sticky_enabled: runtime.stickyEnabled,
+        sticky_mode: runtime.stickyMode,
+        sticky_new_connections_only: runtime.stickyNewConnectionsOnly,
+        sticky_ttl_sec: runtime.stickyTtlSec,
+        sticky_max_entries: runtime.stickyMaxEntries,
+        probe_interval: runtime.probeInterval,
+        probe_sampling: runtime.probeSampling,
+        fastest_stability: runtime.fastestStability,
+        settings_revision: adminSettingsRevision(config),
+        capabilities: { fastest_stability: FASTEST_STABILITY_CAPABILITY },
+        probe_timeout: runtime.probeTimeout,
+        probe_connectivity_url: runtime.probeConnectivityUrl,
+        probe_http_method: runtime.probeHttpMethod,
+        fastest_probe_url: runtime.fastestProbeUrl,
+        protection_enabled: runtime.protectionEnabled,
+        protection_failures: runtime.protectionFailures,
+        protection_release_successes: runtime.protectionReleaseSuccesses,
+        protection_isolation_ttl_sec: runtime.protectionIsolationTtlSec,
+        protection_latency_threshold_ms: runtime.protectionLatencyThresholdMs,
+        protection_min_available_nodes: runtime.protectionMinAvailableNodes,
+        emergency_fallback_enabled: runtime.emergencyFallbackEnabled,
+        emergency_fallback_max_nodes: runtime.emergencyFallbackMaxNodes,
+        balancer_load_weight: runtime.balancerLoadWeight,
+        balancer_latency_weight: runtime.balancerLatencyWeight,
+        balancer_max_latency_ms: runtime.balancerMaxLatencyMs,
+        balancer_smoothing_alpha: runtime.balancerSmoothingAlpha,
+        balancer_hysteresis_delta: runtime.balancerHysteresisDelta,
+    };
+}
+
+// Keys rewritten by background jobs are left out, otherwise an admin save races them and gets a false 409.
+const REVISION_EXCLUDED_KEYS = new Set(['attack_nodes', 'auto_quarantine_nodes']);
+function adminSettingsRevision(value) {
+    return crypto.createHash('sha256').update(JSON.stringify(
+        MUTABLE_CONFIG_KEYS.filter(key => !REVISION_EXCLUDED_KEYS.has(key))
+            .map(key => [key, value[key] === undefined ? null : value[key]])
+    )).digest('hex');
+}
+function requireAutoSettingsRevision(payload, currentConfig) {
+    // Auto controls always need a revision; any other save is checked whenever the client sends one.
+    if (payload.fastest_stability === undefined && payload.settings_revision === undefined) return;
+    const error = new Error('Refresh settings before saving Auto controls');
+    if (typeof payload.settings_revision !== 'string' || !payload.settings_revision) {
+        error.code = 'ADMIN_REVISION_REQUIRED'; throw error;
+    }
+    if (payload.settings_revision !== adminSettingsRevision(currentConfig)) {
+        error.code = 'ADMIN_REVISION_CONFLICT'; throw error;
+    }
+}
+
 function adminBodyErrorStatus(err) {
+    if (err?.code === 'ADMIN_REVISION_REQUIRED') return 428;
+    if (err?.code === 'ADMIN_REVISION_CONFLICT') return 409;
     if (err?.code === 'PAYLOAD_TOO_LARGE') return 413;
     if (err?.message === 'Invalid JSON body') return 400;
     return 422;
@@ -1573,8 +1671,10 @@ function updateHostCatalog(hosts, requestId = 'host-catalog') {
     const nextCatalog = buildAdminHostCatalog(hosts);
     const previousBindingState = JSON.stringify(hostCatalogCache.map(({ uuid, remark }) => ({ uuid, remark })));
     const nextBindingState = JSON.stringify(nextCatalog.map(({ uuid, remark }) => ({ uuid, remark })));
-    const changed = previousBindingState !== nextBindingState;
+    const nextWireFingerprint = hostWireFingerprint(hosts);
+    const changed = previousBindingState !== nextBindingState || lastHostWireFingerprint !== nextWireFingerprint;
 
+    lastHostWireFingerprint = nextWireFingerprint;
     hostCatalogCache = nextCatalog;
     lastHostCatalogRefreshAt = Date.now();
     lastHostCatalogError = null;
@@ -1894,11 +1994,14 @@ function normalizeHeaderValue(value) {
     return raw.trim().replace(/\s+/g, ' ').slice(0, 1024);
 }
 
-function buildSubscriptionCacheKey(token, forwardHeaders = {}) {
+// The upstream receives the client IP, so fresh entries are keyed by it. ignoreClientIp builds the key of the
+// error fallback copy, which lets a client that changed networks still get its last config while upstream is down.
+function buildSubscriptionCacheKey(token, forwardHeaders = {}, opts = {}) {
     const variantHeaders = [];
     for (const [key, value] of Object.entries(forwardHeaders)) {
         const normalizedKey = key.toLowerCase();
         if (!CACHE_VARIANT_HEADERS.has(normalizedKey)) continue;
+        if (opts.ignoreClientIp && normalizedKey === 'x-forwarded-for') continue;
         const normalizedValue = normalizeHeaderValue(value);
         if (normalizedValue) variantHeaders.push([normalizedKey, normalizedValue]);
     }
@@ -1939,12 +2042,15 @@ function sanitizeHeadersForCache(upstreamHeaders = {}) {
     return result;
 }
 
-function getCachedFallback(token) {
+function getCachedFallback(token, fallbackKey = null) {
     const fresh = subscriptionCache.get(token);
     if (fresh) return { kind: 'fresh', item: fresh };
     const stale = subscriptionCache.getStale(token, CACHE_STALE_IF_ERROR_SEC);
     if (stale) return { kind: 'stale', item: stale };
-    return null;
+    if (!fallbackKey) return null;
+    const other = fallbackSubscriptionCache.get(fallbackKey)
+        || fallbackSubscriptionCache.getStale(fallbackKey, CACHE_STALE_IF_ERROR_SEC);
+    return other ? { kind: 'stale', item: other } : null;
 }
 
 function getNegativeCachedResponse(cacheKey) {
@@ -2137,7 +2243,7 @@ function scheduleStartupTasks() {
                 if (shuttingDown) break;
                 if (await warmupToken(token)) warmed += 1;
             }
-            console.log(`рџ”Ґ Warmup: ${warmed}/${WARMUP_TOKENS.length} С‚РѕРєРµРЅРѕРІ`);
+            console.log(`🔥 Warmup: ${warmed}/${WARMUP_TOKENS.length} токенов`);
             return { ok: true, warmed };
         });
     }
@@ -2150,7 +2256,19 @@ function formatStrategyForLog() {
     return STRATEGY;
 }
 
-const server = http.createServer(async (req, res) => {
+const server = http.createServer((req, res) => {
+    handleRequest(req, res).catch((err) => {
+        logger.error('request_handler_crashed', { message: err?.message || String(err) });
+        if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ status: 'error', code: 'INTERNAL_ERROR' }));
+        } else if (!res.writableEnded) {
+            res.destroy();
+        }
+    });
+});
+
+async function handleRequest(req, res) {
     const requestId = normalizeRequestId(req.headers['x-request-id'], crypto.randomUUID());
     let parsedUrl;
     try {
@@ -2214,60 +2332,8 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (req.method === 'GET') {
-            const runtime = getRuntimeConfig();
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-                status: 'ok',
-                request_id: requestId,
-                groups: GROUPS,
-                group_descriptions: GROUP_DESCRIPTIONS,
-                group_hosts: GROUP_HOSTS,
-                strategy: STRATEGY,
-                fastest_group: config.fastest_group !== false,
-                fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
-                fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
-                fastest_fallback: FASTEST_FALLBACK_GROUPS,
-                node_stats_exclude: NODE_STATS_EXCLUDE_GROUPS,
-                expand_groups_to_nodes: EXPAND_GROUPS_TO_NODES,
-                hidden_groups: HIDDEN_GROUPS,
-                hidden_nodes: HIDDEN_NODES,
-                quarantine_nodes: QUARANTINE_NODES,
-                auto_quarantine_nodes: AUTO_QUARANTINE_NODES,
-                attack_nodes: ATTACK_NODES,
-                auto_quarantine_enabled: runtime.autoQuarantineEnabled,
-                auto_quarantine_failures: runtime.autoQuarantineFailures,
-                auto_quarantine_release_successes: runtime.autoQuarantineReleaseSuccesses,
-                auto_quarantine_max_nodes: runtime.autoQuarantineMaxNodes,
-                auto_drain_enabled: runtime.autoDrainEnabled,
-                auto_drain_failures: runtime.autoDrainFailures,
-                auto_drain_release_successes: runtime.autoDrainReleaseSuccesses,
-                auto_drain_load_threshold: runtime.autoDrainLoadThreshold,
-                auto_drain_score_penalty: runtime.autoDrainScorePenalty,
-                sticky_enabled: runtime.stickyEnabled,
-                sticky_mode: runtime.stickyMode,
-                sticky_new_connections_only: runtime.stickyNewConnectionsOnly,
-                sticky_ttl_sec: runtime.stickyTtlSec,
-                sticky_max_entries: runtime.stickyMaxEntries,
-                probe_interval: runtime.probeInterval,
-                probe_sampling: runtime.probeSampling,
-                probe_timeout: runtime.probeTimeout,
-                probe_connectivity_url: runtime.probeConnectivityUrl,
-                probe_http_method: runtime.probeHttpMethod,
-                fastest_probe_url: runtime.fastestProbeUrl,
-                protection_enabled: runtime.protectionEnabled,
-                protection_failures: runtime.protectionFailures,
-                protection_release_successes: runtime.protectionReleaseSuccesses,
-                protection_isolation_ttl_sec: runtime.protectionIsolationTtlSec,
-                protection_latency_threshold_ms: runtime.protectionLatencyThresholdMs,
-                protection_min_available_nodes: runtime.protectionMinAvailableNodes,
-                emergency_fallback_enabled: runtime.emergencyFallbackEnabled,
-                emergency_fallback_max_nodes: runtime.emergencyFallbackMaxNodes,
-                balancer_load_weight: runtime.balancerLoadWeight,
-                balancer_latency_weight: runtime.balancerLatencyWeight,
-                balancer_max_latency_ms: runtime.balancerMaxLatencyMs,
-                balancer_smoothing_alpha: runtime.balancerSmoothingAlpha,
-                balancer_hysteresis_delta: runtime.balancerHysteresisDelta,
-            }));
+            res.end(JSON.stringify(adminGroupsPayload(requestId)));
             return;
         }
 
@@ -2290,7 +2356,8 @@ const server = http.createServer(async (req, res) => {
             const incomingFastestName = payload.fastest_group_name;
 
             const mutationResult = await mutateRuntimeConfig(requestId, (currentConfig) => {
-                const nextConfig = { ...currentConfig };
+                requireAutoSettingsRevision(payload, currentConfig);
+                    const nextConfig = { ...currentConfig };
                 if (incomingGroups !== undefined) {
                     nextConfig.groups = incomingGroups;
                     if (payload.group_hosts === undefined) {
@@ -2336,7 +2403,6 @@ const server = http.createServer(async (req, res) => {
                 }));
                 return;
             }
-            const runtime = getRuntimeConfig();
 
             logger.info('admin_groups_updated', {
                 request_id: requestId,
@@ -2349,55 +2415,7 @@ const server = http.createServer(async (req, res) => {
 
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({
-                status: 'ok',
-                request_id: requestId,
-                groups: GROUPS,
-                group_hosts: GROUP_HOSTS,
-                strategy: STRATEGY,
-                fastest_group: config.fastest_group !== false,
-                fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
-                fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
-                fastest_fallback: FASTEST_FALLBACK_GROUPS,
-                node_stats_exclude: NODE_STATS_EXCLUDE_GROUPS,
-                expand_groups_to_nodes: EXPAND_GROUPS_TO_NODES,
-                hidden_groups: HIDDEN_GROUPS,
-                hidden_nodes: HIDDEN_NODES,
-                quarantine_nodes: QUARANTINE_NODES,
-                auto_quarantine_nodes: AUTO_QUARANTINE_NODES,
-                attack_nodes: ATTACK_NODES,
-                auto_quarantine_enabled: runtime.autoQuarantineEnabled,
-                auto_quarantine_failures: runtime.autoQuarantineFailures,
-                auto_quarantine_release_successes: runtime.autoQuarantineReleaseSuccesses,
-                auto_quarantine_max_nodes: runtime.autoQuarantineMaxNodes,
-                auto_drain_enabled: runtime.autoDrainEnabled,
-                auto_drain_failures: runtime.autoDrainFailures,
-                auto_drain_release_successes: runtime.autoDrainReleaseSuccesses,
-                auto_drain_load_threshold: runtime.autoDrainLoadThreshold,
-                auto_drain_score_penalty: runtime.autoDrainScorePenalty,
-                sticky_enabled: runtime.stickyEnabled,
-                sticky_mode: runtime.stickyMode,
-                sticky_new_connections_only: runtime.stickyNewConnectionsOnly,
-                sticky_ttl_sec: runtime.stickyTtlSec,
-                sticky_max_entries: runtime.stickyMaxEntries,
-                probe_interval: runtime.probeInterval,
-                probe_sampling: runtime.probeSampling,
-                probe_timeout: runtime.probeTimeout,
-                probe_connectivity_url: runtime.probeConnectivityUrl,
-                probe_http_method: runtime.probeHttpMethod,
-                fastest_probe_url: runtime.fastestProbeUrl,
-                protection_enabled: runtime.protectionEnabled,
-                protection_failures: runtime.protectionFailures,
-                protection_release_successes: runtime.protectionReleaseSuccesses,
-                protection_isolation_ttl_sec: runtime.protectionIsolationTtlSec,
-                protection_latency_threshold_ms: runtime.protectionLatencyThresholdMs,
-                protection_min_available_nodes: runtime.protectionMinAvailableNodes,
-                emergency_fallback_enabled: runtime.emergencyFallbackEnabled,
-                emergency_fallback_max_nodes: runtime.emergencyFallbackMaxNodes,
-                balancer_load_weight: runtime.balancerLoadWeight,
-                balancer_latency_weight: runtime.balancerLatencyWeight,
-                balancer_max_latency_ms: runtime.balancerMaxLatencyMs,
-                balancer_smoothing_alpha: runtime.balancerSmoothingAlpha,
-                balancer_hysteresis_delta: runtime.balancerHysteresisDelta,
+                ...adminGroupsPayload(requestId),
                 persisted: mutationResult.persisted,
                 persist_error: mutationResult.error,
             }));
@@ -2895,6 +2913,7 @@ const server = http.createServer(async (req, res) => {
 
     const forwardHeaders = buildForwardHeaders(req, clientIp);
     const cacheKey = buildSubscriptionCacheKey(token, forwardHeaders);
+    const fallbackKey = buildSubscriptionCacheKey(token, forwardHeaders, { ignoreClientIp: true });
     const safePath = redactTokenPath(pathname);
     runtimeStats.requests_total += 1;
     const guardDecision = requestGuard.evaluateRateLimits(clientIp, token);
@@ -2906,7 +2925,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (guardDecision.allowFallback) {
-            const fallback = getCachedFallback(cacheKey);
+            const fallback = getCachedFallback(cacheKey, fallbackKey);
             if (fallback) {
                 runtimeStats.cache_fallback_total += 1;
                 if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
@@ -2955,9 +2974,27 @@ const server = http.createServer(async (req, res) => {
         .some((hostIds) => Array.isArray(hostIds) && hostIds.length > 0);
     if (hasHostBindings) {
         await refreshHostCatalog({ requestId });
-        const unresolvedHostIds = findUnresolvedGroupHostIds(GROUP_HOSTS, hostCatalogCache);
+        let unresolvedHostIds = findUnresolvedGroupHostIds(GROUP_HOSTS, hostCatalogCache);
+        if (unresolvedHostIds.length > 0 && Date.now() - lastUnresolvedForcedRefreshAt > 60000) {
+            // A host may have just been created; re-read the catalog at most once a minute.
+            lastUnresolvedForcedRefreshAt = Date.now();
+            await refreshHostCatalog({ force: true, requestId });
+            unresolvedHostIds = findUnresolvedGroupHostIds(GROUP_HOSTS, hostCatalogCache);
+        }
+        if (unresolvedHostIds.length > 0 && hostCatalogCache.length > 0) {
+            // The catalog is loaded, so these bindings point at hosts deleted in the panel.
+            // resolveConfiguredGroups skips them; the other hosts and name patterns still apply.
+            if (Date.now() - lastUnresolvedWarnAt > 300000) {
+                lastUnresolvedWarnAt = Date.now();
+                logger.warn('host_catalog_bindings_stale', {
+                    request_id: requestId,
+                    unresolved_host_ids: unresolvedHostIds.map(({ groupName, hostId }) => `${groupName}:${hostId}`),
+                });
+            }
+            unresolvedHostIds = [];
+        }
         if (unresolvedHostIds.length > 0) {
-            const fallback = getCachedFallback(cacheKey);
+            const fallback = getCachedFallback(cacheKey, fallbackKey);
             if (fallback) {
                 runtimeStats.cache_fallback_total += 1;
                 if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
@@ -2993,7 +3030,7 @@ const server = http.createServer(async (req, res) => {
 
     const circuitDecision = requestGuard.evaluateCircuit(upstreamKey);
     if (!circuitDecision.ok) {
-        const fallback = getCachedFallback(cacheKey);
+        const fallback = getCachedFallback(cacheKey, fallbackKey);
         if (fallback) {
             runtimeStats.cache_fallback_total += 1;
             if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
@@ -3038,7 +3075,7 @@ const server = http.createServer(async (req, res) => {
             }
 
             if (canFallbackForStatus(upstream.status)) {
-                const fallback = getCachedFallback(cacheKey);
+                const fallback = getCachedFallback(cacheKey, fallbackKey);
                 if (fallback) {
                     runtimeStats.cache_fallback_total += 1;
                     if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
@@ -3108,6 +3145,7 @@ const server = http.createServer(async (req, res) => {
                 cachedHeaders['content-type'] = contentType;
                 if (cacheGeneration === subscriptionCacheGeneration) {
                     subscriptionCache.set(cacheKey, mihomo.body, cachedHeaders);
+                    fallbackSubscriptionCache.set(fallbackKey, mihomo.body, cachedHeaders);
                 } else {
                     logger.info('subscription_cache_store_skipped_after_invalidation', {
                         request_id: requestId,
@@ -3362,8 +3400,10 @@ const server = http.createServer(async (req, res) => {
                 probeConnectivity: runtime.probeConnectivityUrl,
                 probeHttpMethod: runtime.probeHttpMethod,
                 strategy: STRATEGY,
+                nodeDnsScope: NODE_DNS_SCOPE,
                 groupDescription: (GROUP_DESCRIPTIONS && (GROUP_DESCRIPTIONS[fastestGroupName] || GROUP_DESCRIPTIONS['fastest'] || GROUP_DESCRIPTIONS[DEFAULT_FASTEST_GROUP_NAME])) || config.fastest_group_description || '',
             });
+            applyFastestStability(fastestConfig, runtime.fastestStability);
             resultConfigs.push(fastestConfig);
             logger.info('group_fastest', {
                 request_id: requestId,
@@ -3433,6 +3473,7 @@ const server = http.createServer(async (req, res) => {
                 probeConnectivity: runtime.probeConnectivityUrl,
                 probeHttpMethod: runtime.probeHttpMethod,
                 strategy: STRATEGY,
+                nodeDnsScope: NODE_DNS_SCOPE,
                 groupDescription: (GROUP_DESCRIPTIONS && (GROUP_DESCRIPTIONS[configName] || GROUP_DESCRIPTIONS[groupName])) || (entry.kind === 'node' && selectedGroupOutbounds[0] ? (selectedGroupOutbounds[0].serverDescription || selectedGroupOutbounds[0].description || '') : ''),
             });
             resultConfigs.push(groupConfig);
@@ -3473,6 +3514,7 @@ const server = http.createServer(async (req, res) => {
         lastUpstreamError = null;
         if (cacheGeneration === subscriptionCacheGeneration) {
             subscriptionCache.set(cacheKey, responseBody, sanitizeHeadersForCache(upstream.headers));
+            fallbackSubscriptionCache.set(fallbackKey, responseBody, sanitizeHeadersForCache(upstream.headers));
         } else {
             logger.info('subscription_cache_store_skipped_after_invalidation', {
                 request_id: requestId,
@@ -3493,7 +3535,7 @@ const server = http.createServer(async (req, res) => {
             circuitBreakers.cancelProbe(upstreamKey);
         }
         logger.error('request_failed', { request_id: requestId, message: err.message });
-        const fallback = getCachedFallback(cacheKey);
+        const fallback = res.headersSent ? null : getCachedFallback(cacheKey, fallbackKey);
         if (fallback) {
             runtimeStats.cache_fallback_total += 1;
             if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
@@ -3542,7 +3584,7 @@ const server = http.createServer(async (req, res) => {
             res.end(JSON.stringify({ status: 'error', code: 'UPSTREAM_FETCH_FAILED', request_id: requestId }));
         }
     }
-});
+}
 
 // ─── Graceful shutdown ───
 
@@ -3583,6 +3625,9 @@ function shutdown(signal) {
     }
 }
 
+process.on('unhandledRejection', (reason) => {
+    logger.error('unhandled_rejection', { message: reason?.message || String(reason) });
+});
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 

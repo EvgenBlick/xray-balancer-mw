@@ -18,6 +18,15 @@
     "probe_http_method": { "type": "string", "enum": ["HEAD", "GET"] },
     "probe_url": { "type": "string", "pattern": "^https?://" },
     "fastest_probe_url": { "type": "string", "pattern": "^https?://" },
+    "node_dns_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "service_hostnames": { "type": "array", "items": { "type": "string", "minLength": 1 }, "maxItems": 500 },
+        "node_domain_suffixes": { "type": "array", "items": { "type": "string", "minLength": 1 }, "maxItems": 500 },
+        "excluded_endpoints": { "type": "array", "items": { "type": "string", "minLength": 1 }, "maxItems": 500 }
+      }
+    },
     "fastest_group": { "type": "boolean" },
     "fastest_group_name": { "type": "string", "minLength": 1 },
     "fastest_exclude_groups": {

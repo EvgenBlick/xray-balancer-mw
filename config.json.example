@@ -11,6 +11,11 @@
     "probe_http_method": "HEAD",
     "probe_url": "https://www.gstatic.com/generate_204",
     "fastest_probe_url": "https://ya.ru",
+    "node_dns_scope": {
+        "service_hostnames": ["sub.example.com", "panel.example.com"],
+        "node_domain_suffixes": [".example.com"],
+        "excluded_endpoints": ["lte.example.net"]
+    },
 
     "fastest_group": true,
     "fastest_group_name": "🏁 🇪🇺 Самые быстрые",
